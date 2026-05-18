@@ -1,0 +1,16 @@
+[Unit]
+Description=OTP receiver service for Midasbuy bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/eshenlyserver/otp-server
+EnvironmentFile=%h/eshenlyserver/otp-server/.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=3
+StandardOutput=append:%h/eshenlyserver/otp-server/otp-server.log
+StandardError=append:%h/eshenlyserver/otp-server/otp-server.log
+
+[Install]
+WantedBy=default.target

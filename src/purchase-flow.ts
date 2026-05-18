@@ -61,7 +61,11 @@ export async function runPurchaseFlow(page: Page, config: PurchaseConfig): Promi
       return;
     }
 
+    // Capture the timestamp before phase 6 so the OTP wait only matches
+    // SMS that arrived after this purchase initiated.
+    const purchaseStartedAt = Date.now();
     await phase6_confirmAndPay(page, config);
+    await phase7_paymobWallet(page, config, purchaseStartedAt);
     log('done', 'Purchase flow completed successfully');
   } catch (err) {
     logError('flow', `Purchase flow failed: ${err}`);
@@ -613,4 +617,173 @@ async function fillPayerMaxForm(paymentPage: Page, config: PurchaseConfig): Prom
   // Wait 2 seconds after payment to capture final state
   await paymentPage.waitForTimeout(2000);
   await takeScreenshot(paymentPage, 'phase6-after-payment');
+}
+
+// ── Phase 7: Paymob/Vodafone Cash wallet checkout (PIN + OTP) ───────────────
+
+async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseStartedAt: number): Promise<void> {
+  if (!config.walletPin) {
+    log('phase-7', 'WALLET_PIN not set, skipping Paymob checkout');
+    return;
+  }
+
+  const paymentTab = (page as any).__paymentTab as Page;
+  const context = page.context();
+
+  log('phase-7', 'Waiting for Paymob/Vodafone Cash checkout window...');
+
+  // Paymob opens in a new browser-context page after PayerMax submits.
+  // It may already be open by the time we get here.
+  let paymobPage: Page | null =
+    context.pages().find((p) => /paymobsolutions\.com|vcheckout\.paymob/i.test(p.url())) || null;
+
+  if (!paymobPage) {
+    paymobPage = await context
+      .waitForEvent('page', { timeout: 45000, predicate: (p) => /paymobsolutions\.com|vcheckout\.paymob/i.test(p.url()) })
+      .catch(() => null);
+  }
+
+  if (!paymobPage) {
+    // Sometimes PayerMax navigates the same tab instead of opening a new one
+    if (paymentTab && /paymobsolutions\.com|vcheckout\.paymob/i.test(paymentTab.url())) {
+      paymobPage = paymentTab;
+    }
+  }
+
+  if (!paymobPage) {
+    throw new Error('Paymob checkout window did not appear within 45s');
+  }
+
+  try {
+    await paymobPage.waitForLoadState('domcontentloaded', { timeout: 15000 });
+    await paymobPage.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  } catch { /* continue anyway */ }
+
+  log('phase-7', `Paymob URL: ${paymobPage.url()}`);
+  await takeScreenshot(paymobPage, 'phase7-paymob-loaded');
+
+  // Extract expected amount from the PayerMax URL (e.g. &amount=41.99)
+  const m = (paymentTab?.url() || '').match(/[?&]amount=([\d.]+)/);
+  const expectedAmount = m ? parseFloat(m[1]) : NaN;
+  if (Number.isFinite(expectedAmount)) {
+    log('phase-7', `Expected charge amount: ${expectedAmount} EGP`);
+  } else {
+    log('phase-7', 'Warning: could not detect amount from PayerMax URL');
+  }
+
+  // Fill PIN
+  await fillPaymobInput(paymobPage, 'pin', config.walletPin);
+  log('phase-7', 'PIN entered');
+
+  // Long-poll the OTP receiver for an OTP matching this amount
+  log('phase-7', `Polling OTP receiver (timeout ${Math.round(config.otpTimeoutMs / 1000)}s)...`);
+  const otp = await waitForOtp(config, expectedAmount, purchaseStartedAt);
+  if (!otp) {
+    await takeScreenshot(paymobPage, 'phase7-otp-timeout');
+    throw new Error('OTP not received within timeout');
+  }
+  log('phase-7', `OTP received: ${otp}`);
+
+  await fillPaymobInput(paymobPage, 'otp', otp);
+  log('phase-7', 'OTP entered');
+  await takeScreenshot(paymobPage, 'phase7-before-pay');
+
+  // Click "Pay with Wallet"
+  const payBtn = paymobPage.getByRole('button', { name: /pay with wallet|الدفع/i });
+  try {
+    await payBtn.waitFor({ state: 'visible', timeout: 5000 });
+    await payBtn.click();
+    log('phase-7', 'Clicked Pay with Wallet');
+  } catch {
+    // Fallback: click any button on the page
+    log('phase-7', 'Pay button not found by role, trying fallback...');
+    await paymobPage.evaluate(() => {
+      const btns = document.querySelectorAll('button, input[type="submit"]');
+      for (const b of btns) {
+        const txt = (b as HTMLElement).innerText || (b as HTMLInputElement).value || '';
+        if (/pay|wallet|دفع/i.test(txt)) {
+          (b as HTMLElement).click();
+          return;
+        }
+      }
+    });
+  }
+
+  // Wait for the success page or redirect
+  await paymobPage.waitForTimeout(8000);
+  await takeScreenshot(paymobPage, 'phase7-after-pay');
+  log('phase-7', `Final URL: ${paymobPage.url()}`);
+}
+
+async function fillPaymobInput(paymobPage: Page, kind: 'pin' | 'otp', value: string): Promise<void> {
+  const labelRegex = kind === 'pin'
+    ? /الرقم السري للمحفظة|PIN/i
+    : /الرقم السري المتغير|OTP/i;
+
+  // Strategy 1: explicit label association
+  try {
+    const byLabel = paymobPage.getByLabel(labelRegex);
+    if (await byLabel.isVisible({ timeout: 2000 })) {
+      await byLabel.fill(value);
+      return;
+    }
+  } catch { /* try next */ }
+
+  // Strategy 2: input nearest to a matching label text in DOM order
+  const filled = await paymobPage.evaluate(({ kind, value }) => {
+    const all = Array.from(document.querySelectorAll<HTMLElement>('label, p, span, div'));
+    const labelPattern = kind === 'pin'
+      ? /الرقم السري للمحفظة|PIN/i
+      : /الرقم السري المتغير|OTP/i;
+    for (const el of all) {
+      if (el.children.length > 5) continue;
+      if (!labelPattern.test(el.textContent || '')) continue;
+      // Find nearest input after this element
+      const root = el.parentElement || document.body;
+      const inputs = root.querySelectorAll<HTMLInputElement>('input:not([readonly]):not([disabled])');
+      for (const inp of inputs) {
+        // Skip the wallet number input (read-only or pre-filled with phone)
+        if (inp.value && /^\d{10,12}$/.test(inp.value)) continue;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(inp, value);
+        else inp.value = value;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+    }
+    return false;
+  }, { kind, value });
+
+  if (filled) return;
+
+  // Strategy 3: fall back to nth password/text input (PIN=1st, OTP=2nd, wallet number assumed read-only)
+  const inputs = paymobPage.locator('input:not([readonly]):not([disabled])');
+  const count = await inputs.count();
+  const idx = kind === 'pin' ? 0 : Math.min(1, count - 1);
+  await inputs.nth(idx).fill(value);
+}
+
+async function waitForOtp(config: PurchaseConfig, expectedAmount: number, sinceMs: number): Promise<string | null> {
+  if (!config.otpReceiverUrl || !config.otpReceiverToken) {
+    log('phase-7', 'OTP receiver not configured (OTP_RECEIVER_URL / OTP_RECEIVER_TOKEN)');
+    return null;
+  }
+  const amountParam = Number.isFinite(expectedAmount) ? `&amount=${expectedAmount}` : '';
+  const url = `${config.otpReceiverUrl}/otp/wait?since=${sinceMs}&timeout=${config.otpTimeoutMs}${amountParam}`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'X-Token': config.otpReceiverToken },
+      signal: AbortSignal.timeout(config.otpTimeoutMs + 5000),
+    });
+    if (!res.ok) {
+      log('phase-7', `OTP receiver returned ${res.status}`);
+      return null;
+    }
+    const body = (await res.json()) as { otp?: string };
+    return body.otp || null;
+  } catch (err) {
+    log('phase-7', `OTP receiver error: ${err}`);
+    return null;
+  }
 }
