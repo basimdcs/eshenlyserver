@@ -5,3 +5,4 @@ screenshots/
 .playwright-mcp/
 *.png
 TEST_LOG.md
+.claude/
