@@ -1,4 +1,6 @@
 import { chromium } from 'playwright';
+import * as fs from 'fs';
+import * as path from 'path';
 import { parseArgs } from './config';
 import { runPurchaseFlow } from './purchase-flow';
 import { log, logError } from './utils';
@@ -70,6 +72,53 @@ async function main(): Promise<void> {
         return route.abort();
       }
       return route.continue();
+    });
+  }
+
+  if (process.env.NETWORK_TRACE === 'true') {
+    const tracePath = path.join(process.cwd(), `trace-${Date.now()}.jsonl`);
+    const traceFile = fs.createWriteStream(tracePath, { flags: 'a' });
+    log('trace', `Writing network trace to ${tracePath}`);
+
+    const writeEntry = (entry: Record<string, unknown>) => {
+      traceFile.write(JSON.stringify(entry) + '\n');
+    };
+
+    context.on('request', (req) => {
+      const type = req.resourceType();
+      if (type !== 'xhr' && type !== 'fetch' && type !== 'document') return;
+      writeEntry({
+        ts: Date.now(),
+        kind: 'request',
+        method: req.method(),
+        url: req.url(),
+        resourceType: type,
+        headers: req.headers(),
+        postData: req.postData() || null,
+      });
+    });
+
+    context.on('response', async (res) => {
+      const req = res.request();
+      const type = req.resourceType();
+      if (type !== 'xhr' && type !== 'fetch' && type !== 'document') return;
+      let body: string | null = null;
+      try {
+        const buf = await res.body();
+        body = buf.toString('utf8');
+        if (body.length > 200_000) body = body.slice(0, 200_000) + '…[truncated]';
+      } catch {
+        body = null;
+      }
+      writeEntry({
+        ts: Date.now(),
+        kind: 'response',
+        status: res.status(),
+        url: res.url(),
+        resourceType: type,
+        headers: res.headers(),
+        body,
+      });
     });
   }
 
