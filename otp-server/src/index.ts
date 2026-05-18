@@ -123,8 +123,10 @@ async function handleWait(req: http.IncomingMessage, res: http.ServerResponse): 
 }
 
 const server = http.createServer(async (req, res) => {
+  const remoteAddr = req.socket.remoteAddress;
   try {
     const url = new URL(req.url!, 'http://x');
+    log('req', `${remoteAddr} ${req.method} ${url.pathname}${url.search}`);
     if (req.method === 'POST' && url.pathname === '/otp') {
       await handlePost(req, res);
       return;
@@ -139,7 +141,7 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(404).end('not found');
   } catch (err) {
-    log('error', String(err));
+    log('error', `${remoteAddr} ${String(err)}`);
     res.writeHead(500).end('error');
   }
 });
