@@ -1,0 +1,19 @@
+{
+  "name": "carry1st-bot",
+  "version": "1.0.0",
+  "description": "Automated PUBG Mobile UC top-up bot for shop.carry1st.com",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx src/index.ts",
+    "start:headed": "HEADLESS=false npx tsx src/index.ts",
+    "start:proxy": "HEADLESS=false npx tsx src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

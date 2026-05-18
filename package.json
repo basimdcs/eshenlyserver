@@ -1,0 +1,19 @@
+{
+  "name": "midasbuy-pubg-bot",
+  "version": "1.0.0",
+  "description": "Automate PUBG Mobile UC purchases from Midasbuy Egypt",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "ts-node": "^10.9.2",
+    "@types/node": "^22.10.2"
+  }
+}
