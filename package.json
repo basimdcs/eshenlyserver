@@ -4,7 +4,8 @@
   "description": "Automate PUBG Mobile UC purchases from Midasbuy Egypt",
   "scripts": {
     "start": "ts-node src/index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "serve": "node dist/index.js"
   },
   "dependencies": {
     "commander": "^12.1.0",

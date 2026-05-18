@@ -31,6 +31,16 @@ async function main(): Promise<void> {
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--no-first-run',
+      '--mute-audio',
+      '--js-flags=--max-old-space-size=384',
     ],
   });
 
