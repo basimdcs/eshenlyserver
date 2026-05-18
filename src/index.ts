@@ -58,6 +58,16 @@ async function main(): Promise<void> {
 
   const page = await context.newPage();
 
+  if (process.env.BLOCK_MEDIA === 'true') {
+    await page.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (type === 'image' || type === 'media' || type === 'font') {
+        return route.abort();
+      }
+      return route.continue();
+    });
+  }
+
   try {
     await runPurchaseFlow(page, config);
     log('done', 'All phases completed successfully');
