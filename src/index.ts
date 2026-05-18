@@ -27,6 +27,7 @@ async function main(): Promise<void> {
   const browser = await chromium.launch({
     headless: config.headless,
     channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
+    executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
     proxy: proxyConfig,
     args: [
       '--disable-blink-features=AutomationControlled',
@@ -40,6 +41,10 @@ async function main(): Promise<void> {
       '--disable-sync',
       '--no-first-run',
       '--mute-audio',
+      '--single-process',
+      '--no-zygote',
+      '--renderer-process-limit=1',
+      '--disable-features=site-per-process,IsolateOrigins,TranslateUI',
       '--js-flags=--max-old-space-size=384',
     ],
   });

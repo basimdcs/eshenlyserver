@@ -5,7 +5,8 @@
   "scripts": {
     "start": "ts-node src/index.ts",
     "build": "tsc",
-    "serve": "node dist/index.js"
+    "serve": "node dist/index.js",
+    "run": "bin/run-bot.sh"
   },
   "dependencies": {
     "commander": "^12.1.0",
