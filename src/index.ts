@@ -26,6 +26,7 @@ async function main(): Promise<void> {
 
   const browser = await chromium.launch({
     headless: config.headless,
+    channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
     proxy: proxyConfig,
     args: [
       '--disable-blink-features=AutomationControlled',
