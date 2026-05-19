@@ -661,6 +661,7 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
 
   log('phase-7', `Paymob URL: ${paymobPage.url()}`);
   await takeScreenshot(paymobPage, 'phase7-paymob-loaded');
+  await dumpPaymobHtml(paymobPage, 'phase7-paymob-loaded');
 
   // Extract expected amount from the PayerMax URL (e.g. &amount=41.99)
   const m = (paymentTab?.url() || '').match(/[?&]amount=([\d.]+)/);
@@ -830,52 +831,60 @@ async function dumpPaymobHtml(page: Page, label: string): Promise<void> {
 }
 
 async function fillPaymobInput(paymobPage: Page, kind: 'pin' | 'otp', value: string): Promise<void> {
-  const labelRegex = kind === 'pin'
-    ? /الرقم السري للمحفظة|PIN/i
-    : /الرقم السري المتغير|OTP/i;
-
-  // Strategy 1: explicit label association
-  try {
-    const byLabel = paymobPage.getByLabel(labelRegex);
-    if (await byLabel.isVisible({ timeout: 2000 })) {
-      await byLabel.fill(value);
-      return;
-    }
-  } catch { /* try next */ }
-
-  // Strategy 2: input nearest to a matching label text in DOM order
-  const filled = await paymobPage.evaluate(({ kind, value }) => {
-    const all = Array.from(document.querySelectorAll<HTMLElement>('label, p, span, div'));
+  // Find the actual input element via label proximity (handles Arabic + English labels,
+  // skips the read-only wallet number input)
+  const inputHandle = await paymobPage.evaluateHandle((kind) => {
     const labelPattern = kind === 'pin'
       ? /الرقم السري للمحفظة|PIN/i
       : /الرقم السري المتغير|OTP/i;
-    for (const el of all) {
-      if (el.children.length > 5) continue;
-      if (!labelPattern.test(el.textContent || '')) continue;
-      // Find nearest input after this element
-      const root = el.parentElement || document.body;
-      const inputs = root.querySelectorAll<HTMLInputElement>('input:not([readonly]):not([disabled])');
-      for (const inp of inputs) {
-        // Skip the wallet number input (read-only or pre-filled with phone)
-        if (inp.value && /^\d{10,12}$/.test(inp.value)) continue;
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-        if (setter) setter.call(inp, value);
-        else inp.value = value;
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
+    const excludePattern = kind === 'pin'
+      ? /الرقم السري المتغير|OTP/i
+      : /الرقم السري للمحفظة|PIN/i;
+
+    const candidateInputs = Array.from(
+      document.querySelectorAll<HTMLInputElement>('input:not([readonly]):not([disabled])'),
+    ).filter((i) => !/^\d{10,12}$/.test(i.value));
+
+    // For each candidate, walk up the DOM to find an ancestor whose visible text
+    // matches our label but NOT the other field's label.
+    for (const inp of candidateInputs) {
+      let el: Element | null = inp.parentElement;
+      let depth = 0;
+      while (el && depth < 6) {
+        const text = (el.textContent || '').trim();
+        if (labelPattern.test(text) && !excludePattern.test(text)) {
+          return inp;
+        }
+        el = el.parentElement;
+        depth++;
       }
     }
-    return false;
-  }, { kind, value });
+    return null;
+  }, kind);
 
-  if (filled) return;
+  const element = inputHandle.asElement() as Awaited<ReturnType<Page['$']>> | null;
+  if (element) {
+    // Real keyboard typing — works against React/Vue/Svelte controlled components
+    await element.scrollIntoViewIfNeeded().catch(() => {});
+    await element.click({ delay: 30 });
+    await paymobPage.keyboard.press('ControlOrMeta+a').catch(() => {});
+    await paymobPage.keyboard.press('Delete').catch(() => {});
+    await paymobPage.keyboard.type(value, { delay: 60 });
+    return;
+  }
 
-  // Strategy 3: fall back to nth password/text input (PIN=1st, OTP=2nd, wallet number assumed read-only)
-  const inputs = paymobPage.locator('input:not([readonly]):not([disabled])');
+  // Fallback: nth non-readonly visible input. PIN field is the only one before OTP arrives.
+  const inputs = paymobPage.locator('input:not([readonly]):not([disabled])').filter({
+    has: paymobPage.locator(':not([value^="01"])'),
+  });
   const count = await inputs.count();
   const idx = kind === 'pin' ? 0 : Math.min(1, count - 1);
-  await inputs.nth(idx).fill(value);
+  const target = inputs.nth(idx);
+  await target.scrollIntoViewIfNeeded().catch(() => {});
+  await target.click({ delay: 30 });
+  await paymobPage.keyboard.press('ControlOrMeta+a').catch(() => {});
+  await paymobPage.keyboard.press('Delete').catch(() => {});
+  await paymobPage.keyboard.type(value, { delay: 60 });
 }
 
 async function waitForOtp(config: PurchaseConfig, expectedAmount: number, sinceMs: number): Promise<string | null> {
