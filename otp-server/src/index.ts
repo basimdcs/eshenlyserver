@@ -2,6 +2,7 @@ import * as http from 'http';
 import 'dotenv/config';
 
 const PORT = parseInt(process.env.OTP_PORT || '8787', 10);
+const HOST = process.env.OTP_HOST || '127.0.0.1';
 const TOKEN = process.env.OTP_TOKEN || '';
 if (!TOKEN) {
   console.error('OTP_TOKEN env required');
@@ -146,6 +147,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  log('start', `OTP receiver listening on 0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  log('start', `OTP receiver listening on ${HOST}:${PORT}`);
 });
