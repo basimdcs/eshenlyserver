@@ -555,7 +555,8 @@ async function fillPayerMaxForm(paymentPage: Page, config: PurchaseConfig): Prom
     await phoneLabel.click();
     await paymentPage.waitForTimeout(300);
     // Select all existing text and replace
-    await paymentPage.keyboard.press('Meta+a');
+    await paymentPage.keyboard.press('ControlOrMeta+a');
+    await paymentPage.keyboard.press('Delete');
     await paymentPage.keyboard.type(config.phone, { delay: 50 });
     log('phase-6', `Phone filled: ${config.phone}`);
   } catch {
@@ -568,13 +569,32 @@ async function fillPayerMaxForm(paymentPage: Page, config: PurchaseConfig): Prom
     const emailLabel = paymentPage.getByText('Email');
     await emailLabel.click();
     await paymentPage.waitForTimeout(300);
-    await paymentPage.keyboard.press('Meta+a');
+    await paymentPage.keyboard.press('ControlOrMeta+a');
+    await paymentPage.keyboard.press('Delete');
     await paymentPage.keyboard.type(config.email, { delay: 50 });
     log('phase-6', `Email filled: ${config.email}`);
   } catch {
     log('phase-6', 'ERROR: Could not fill email input');
   }
   await paymentPage.waitForTimeout(500);
+
+  // Verify the form actually contains our values — catches the case where the
+  // form was pre-populated (e.g. customer's info from upstream) and our fill
+  // didn't clear it cleanly.
+  const formValues = await paymentPage.evaluate(() => {
+    return Array.from(document.querySelectorAll('input')).map((i) => ({
+      type: i.type,
+      placeholder: i.placeholder || '',
+      value: i.value || '',
+    }));
+  });
+  const phoneOk = formValues.some((f) => f.value === config.phone);
+  const emailOk = formValues.some((f) => f.value === config.email);
+  if (!phoneOk || !emailOk) {
+    log('phase-6', `Form values mismatch: ${JSON.stringify(formValues)}`);
+    throw new Error(`PayerMax form does not contain expected values (phoneOk=${phoneOk} emailOk=${emailOk})`);
+  }
+  log('phase-6', 'Form values verified');
 
   // Uncheck "Save information" — it's checked by default, click to toggle off
   try {
