@@ -671,9 +671,9 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
     log('phase-7', 'Warning: could not detect amount from PayerMax URL');
   }
 
-  // Fill PIN
-  await fillPaymobInput(paymobPage, 'pin', config.walletPin);
-  log('phase-7', 'PIN entered');
+  // Fill PIN — verified after fill so we don't silently submit empty
+  await fillAndVerifyPaymob(paymobPage, 'pin', config.walletPin);
+  log('phase-7', 'PIN entered and verified');
 
   // Long-poll the OTP receiver for an OTP matching this amount
   log('phase-7', `Polling OTP receiver (timeout ${Math.round(config.otpTimeoutMs / 1000)}s)...`);
@@ -684,9 +684,13 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
   }
   log('phase-7', `OTP received: ${otp}`);
 
-  await fillPaymobInput(paymobPage, 'otp', otp);
-  log('phase-7', 'OTP entered');
+  await fillAndVerifyPaymob(paymobPage, 'otp', otp);
+  log('phase-7', 'OTP entered and verified');
   await takeScreenshot(paymobPage, 'phase7-before-pay');
+
+  // Snapshot DOM before click so we can diff after
+  const preClickError = await readPaymobErrorText(paymobPage);
+  const preClickUrl = paymobPage.url();
 
   // Click "Pay with Wallet"
   const payBtn = paymobPage.getByRole('button', { name: /pay with wallet|الدفع/i });
@@ -695,7 +699,6 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
     await payBtn.click();
     log('phase-7', 'Clicked Pay with Wallet');
   } catch {
-    // Fallback: click any button on the page
     log('phase-7', 'Pay button not found by role, trying fallback...');
     await paymobPage.evaluate(() => {
       const btns = document.querySelectorAll('button, input[type="submit"]');
@@ -709,10 +712,121 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
     });
   }
 
-  // Wait for the success page or redirect
-  await paymobPage.waitForTimeout(8000);
+  // Wait for a terminal state: URL change (success) or error text on page (failure)
+  const outcome = await waitForPaymobOutcome(paymobPage, preClickUrl, preClickError);
   await takeScreenshot(paymobPage, 'phase7-after-pay');
-  log('phase-7', `Final URL: ${paymobPage.url()}`);
+
+  if (outcome.kind === 'success') {
+    log('phase-7', `Paymob completed → redirected to ${paymobPage.url()}`);
+    return;
+  }
+
+  // Failure path: capture HTML and the error text
+  await dumpPaymobHtml(paymobPage, 'phase7-failure');
+  if (outcome.kind === 'error') {
+    log('phase-7', `Paymob error text: "${outcome.message}"`);
+    throw new Error(`Paymob rejected payment: ${outcome.message}`);
+  }
+  log('phase-7', `Paymob did not redirect or show error within 30s. URL: ${paymobPage.url()}`);
+  throw new Error('Paymob did not reach a terminal state within 30s after clicking Pay');
+}
+
+async function fillAndVerifyPaymob(page: Page, kind: 'pin' | 'otp', value: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await fillPaymobInput(page, kind, value);
+    await page.waitForTimeout(300);
+    const ok = await page.evaluate(({ kind, expectedLen }) => {
+      const inputs = Array.from(
+        document.querySelectorAll<HTMLInputElement>('input:not([readonly]):not([disabled])'),
+      ).filter((i) => !/^\d{10,12}$/.test(i.value)); // exclude pre-filled wallet number
+      const idx = kind === 'pin' ? 0 : 1;
+      const inp = inputs[idx];
+      return inp ? inp.value.length === expectedLen : false;
+    }, { kind, expectedLen: value.length });
+    if (ok) return;
+    log('phase-7', `${kind} fill verification failed (attempt ${attempt + 1}/3), retrying...`);
+  }
+  throw new Error(`Failed to enter ${kind} value into Paymob form after 3 attempts`);
+}
+
+interface PaymobOutcome {
+  kind: 'success' | 'error' | 'timeout';
+  message?: string;
+}
+
+async function waitForPaymobOutcome(
+  page: Page,
+  initialUrl: string,
+  preClickError: string | null,
+): Promise<PaymobOutcome> {
+  const start = Date.now();
+  while (Date.now() - start < 30_000) {
+    // 1. URL change → success
+    if (page.url() !== initialUrl && !/paymobsolutions\.com|vcheckout\.paymob/i.test(page.url())) {
+      return { kind: 'success' };
+    }
+    // 2. New error text appearing → failure
+    const errorText = await readPaymobErrorText(page);
+    if (errorText && errorText !== preClickError) {
+      return { kind: 'error', message: errorText };
+    }
+    await page.waitForTimeout(500);
+  }
+  return { kind: 'timeout' };
+}
+
+async function readPaymobErrorText(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const isRedColor = (color: string): boolean => {
+      // rgb(220, 53, 69), rgb(255, 0, 0), #d32, #c00...
+      const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (m) {
+        const r = parseInt(m[1], 10);
+        const g = parseInt(m[2], 10);
+        const b = parseInt(m[3], 10);
+        return r > 150 && g < 100 && b < 100;
+      }
+      return /^#[ce][a-f0-9]{2}/i.test(color);
+    };
+
+    const candidates: Element[] = [];
+    // Explicit error classes
+    candidates.push(
+      ...document.querySelectorAll(
+        '[class*="error" i], [class*="invalid" i], [class*="alert" i], [class*="fail" i], [role="alert"]',
+      ),
+    );
+    // Red text — scan all small text elements
+    document.querySelectorAll('p, div, span, label, small, strong').forEach((el) => {
+      const text = el.textContent?.trim() || '';
+      if (text.length < 4 || text.length > 300) return;
+      const cs = window.getComputedStyle(el as HTMLElement);
+      if (isRedColor(cs.color)) candidates.push(el);
+    });
+
+    for (const c of candidates) {
+      const text = c.textContent?.trim() || '';
+      if (text.length >= 4 && text.length <= 300 && !/checkout|wallet/i.test(text)) {
+        return text;
+      }
+    }
+    return null;
+  });
+}
+
+async function dumpPaymobHtml(page: Page, label: string): Promise<void> {
+  try {
+    const html = await page.content();
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const dir = path.join(process.cwd(), 'screenshots');
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${Date.now()}-${label}.html`);
+    await fs.writeFile(file, html, 'utf8');
+    log('phase-7', `HTML snapshot: ${file}`);
+  } catch (err) {
+    log('phase-7', `Failed to dump HTML: ${err}`);
+  }
 }
 
 async function fillPaymobInput(paymobPage: Page, kind: 'pin' | 'otp', value: string): Promise<void> {

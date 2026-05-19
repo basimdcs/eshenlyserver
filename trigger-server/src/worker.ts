@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import 'dotenv/config';
 import { hmacSign } from './crypto';
@@ -19,10 +20,18 @@ function log(tag: string, msg: string): void {
   console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
 }
 
-function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: number | null; tradeToken: string | null }> {
+function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: number | null; tradeToken: string | null; logFile: string }> {
   return new Promise((resolve) => {
     const args = ['--player-id', job.player_id, '--sku', String(job.sku)];
-    log('spawn', `${BOT_SCRIPT} ${args.join(' ')}`);
+
+    // Per-job log file for full traceability (kept even on success)
+    const logsDir = path.join(__dirname, '..', 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    const logFile = path.join(logsDir, `${job.id}.log`);
+    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+    logStream.write(`# job=${job.id} order=${job.order_id} player=${job.player_id} sku=${job.sku} started=${new Date().toISOString()}\n`);
+
+    log('spawn', `${BOT_SCRIPT} ${args.join(' ')} → ${logFile}`);
     const child = spawn(BOT_SCRIPT, args, {
       cwd: BOT_DIR,
       env: process.env,
@@ -32,12 +41,12 @@ function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: 
     let amount: number | null = null;
     let tradeToken: string | null = null;
     const capture = (chunk: Buffer) => {
+      logStream.write(chunk);
       const text = chunk.toString('utf8');
       for (const line of text.split('\n')) {
         if (!line.trim()) continue;
         lines.push(line);
-        if (lines.length > 200) lines.shift();
-        // Extract amount + tradeToken from log lines
+        if (lines.length > 400) lines.shift();
         const m1 = line.match(/Expected charge amount:\s*([\d.]+)/);
         if (m1) amount = parseFloat(m1[1]);
         const m2 = line.match(/Payment tab opened:\s*(\S+)/);
@@ -50,7 +59,8 @@ function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: 
     child.stdout.on('data', capture);
     child.stderr.on('data', capture);
     child.on('close', (exitCode) => {
-      resolve({ exitCode: exitCode ?? -1, logTail: lines.slice(-40).join('\n'), amount, tradeToken });
+      logStream.end(`# exit=${exitCode} finished=${new Date().toISOString()}\n`);
+      resolve({ exitCode: exitCode ?? -1, logTail: lines.slice(-60).join('\n'), amount, tradeToken, logFile });
     });
   });
 }
@@ -98,15 +108,19 @@ async function processOne(job: Job): Promise<void> {
     });
     log('success', `job=${job.id} amount=${result.amount} duration=${duration}ms`);
   } else {
-    // Extract last error message from log
-    const errLine = result.logTail.split('\n').reverse().find((l) => /\[error|ERROR|Failed|throw/i.test(l)) || `exit ${result.exitCode}`;
+    // Prefer a clean "Paymob rejected payment: ..." line if present, else last error-ish line
+    const allLines = result.logTail.split('\n');
+    const paymobErr = allLines.reverse().find((l) => /Paymob rejected payment:/i.test(l));
+    const errLine = paymobErr
+      || allLines.find((l) => /\[error|ERROR|Failed|throw/i.test(l))
+      || `exit ${result.exitCode}`;
     markFinished(job.id, 'failed', {
       amount_charged: result.amount,
       trade_token: result.tradeToken,
       duration_ms: duration,
       error: errLine.slice(0, 500),
     });
-    log('failed', `job=${job.id} exit=${result.exitCode} error="${errLine.slice(0, 120)}"`);
+    log('failed', `job=${job.id} exit=${result.exitCode} error="${errLine.slice(0, 200)}" log=${result.logFile}`);
   }
 }
 

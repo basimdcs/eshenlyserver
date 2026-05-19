@@ -4,3 +4,4 @@ dist/
 queue.db
 queue.db-*
 *.log
+logs/
