@@ -635,17 +635,17 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
   // Paymob opens in a new browser-context page after PayerMax submits.
   // It may already be open by the time we get here.
   let paymobPage: Page | null =
-    context.pages().find((p) => /paymobsolutions\.com|vcheckout\.paymob/i.test(p.url())) || null;
+    context.pages().find((p) => /vcheckout\.paymob(solutions)?\.com\/checkout/i.test(p.url())) || null;
 
   if (!paymobPage) {
     paymobPage = await context
-      .waitForEvent('page', { timeout: 45000, predicate: (p) => /paymobsolutions\.com|vcheckout\.paymob/i.test(p.url()) })
+      .waitForEvent('page', { timeout: 45000, predicate: (p) => /vcheckout\.paymob(solutions)?\.com\/checkout/i.test(p.url()) })
       .catch(() => null);
   }
 
   if (!paymobPage) {
     // Sometimes PayerMax navigates the same tab instead of opening a new one
-    if (paymentTab && /paymobsolutions\.com|vcheckout\.paymob/i.test(paymentTab.url())) {
+    if (paymentTab && /vcheckout\.paymob(solutions)?\.com\/checkout/i.test(paymentTab.url())) {
       paymobPage = paymentTab;
     }
   }
@@ -762,13 +762,20 @@ async function waitForPaymobOutcome(
 ): Promise<PaymobOutcome> {
   const start = Date.now();
   while (Date.now() - start < 30_000) {
-    // 1. URL change away from Paymob → success
+    // 1. URL change away from the Paymob checkout form → success/failure
     const currentUrl = page.url();
-    if (currentUrl !== initialUrl && !/paymobsolutions\.com|vcheckout\.paymob/i.test(currentUrl)) {
+    if (currentUrl !== initialUrl && !/vcheckout\.paymob(solutions)?\.com\/checkout/i.test(currentUrl)) {
       // Wait for the destination page to settle, then verify success vs failure
       await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
       const finalUrl = page.url();
-      // page-gateway/user/result/SUCCESS or FAIL is the standard merchant result page
+      // Paymob post_pay URL carries success=true|false in the query string
+      const pm = finalUrl.match(/[?&]success=(true|false)\b/i);
+      if (pm) {
+        if (pm[1].toLowerCase() === 'true') return { kind: 'success' };
+        const errMatch = finalUrl.match(/[?&]data\.message=([^&]+)/);
+        return { kind: 'error', message: `Paymob declined: ${errMatch ? decodeURIComponent(errMatch[1]) : finalUrl}` };
+      }
+      // PayerMax/Midasbuy result page convention
       if (/\/result\/SUCCESS\b/i.test(finalUrl)) return { kind: 'success' };
       if (/\/result\/FAIL\b/i.test(finalUrl)) {
         return { kind: 'error', message: `Merchant reported failure: ${finalUrl}` };
