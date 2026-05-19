@@ -1,0 +1,16 @@
+[Unit]
+Description=Trigger worker (queue → bot runner) for Midasbuy bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/eshenlyserver/trigger-server
+EnvironmentFile=%h/eshenlyserver/trigger-server/.env
+ExecStart=/usr/bin/node dist/worker.js
+Restart=always
+RestartSec=3
+StandardOutput=append:%h/eshenlyserver/trigger-server/trigger-worker.log
+StandardError=append:%h/eshenlyserver/trigger-server/trigger-worker.log
+
+[Install]
+WantedBy=default.target

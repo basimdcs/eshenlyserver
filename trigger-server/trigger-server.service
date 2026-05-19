@@ -1,0 +1,16 @@
+[Unit]
+Description=Trigger server (signed webhook receiver) for Midasbuy bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/eshenlyserver/trigger-server
+EnvironmentFile=%h/eshenlyserver/trigger-server/.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=always
+RestartSec=3
+StandardOutput=append:%h/eshenlyserver/trigger-server/trigger-server.log
+StandardError=append:%h/eshenlyserver/trigger-server/trigger-server.log
+
+[Install]
+WantedBy=default.target
