@@ -762,12 +762,34 @@ async function waitForPaymobOutcome(
 ): Promise<PaymobOutcome> {
   const start = Date.now();
   while (Date.now() - start < 30_000) {
-    // 1. URL change → success
-    if (page.url() !== initialUrl && !/paymobsolutions\.com|vcheckout\.paymob/i.test(page.url())) {
+    // 1. URL change away from Paymob → success
+    const currentUrl = page.url();
+    if (currentUrl !== initialUrl && !/paymobsolutions\.com|vcheckout\.paymob/i.test(currentUrl)) {
+      // Wait for the destination page to settle, then verify success vs failure
+      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+      const finalUrl = page.url();
+      // page-gateway/user/result/SUCCESS or FAIL is the standard merchant result page
+      if (/\/result\/SUCCESS\b/i.test(finalUrl)) return { kind: 'success' };
+      if (/\/result\/FAIL\b/i.test(finalUrl)) {
+        return { kind: 'error', message: `Merchant reported failure: ${finalUrl}` };
+      }
+      // Different host but not the expected result format — log and assume success
       return { kind: 'success' };
     }
     // 2. New error text appearing → failure
-    const errorText = await readPaymobErrorText(page);
+    //    Wrap in try/catch: if the page navigates mid-evaluate, that's a strong
+    //    success signal (Paymob only navigates on success).
+    let errorText: string | null = null;
+    try {
+      errorText = await readPaymobErrorText(page);
+    } catch (err) {
+      if (/Execution context was destroyed|Target closed|frame was detached/i.test(String(err))) {
+        // Page is navigating — let next loop iteration see the new URL
+        await page.waitForTimeout(500);
+        continue;
+      }
+      throw err;
+    }
     if (errorText && errorText !== preClickError) {
       return { kind: 'error', message: errorText };
     }
