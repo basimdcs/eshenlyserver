@@ -712,6 +712,7 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
   // Snapshot DOM before click so we can diff after
   const preClickError = await readPaymobErrorText(paymobPage);
   const preClickUrl = paymobPage.url();
+  const clickedAt = Date.now();
 
   // Click "Pay with Wallet"
   const payBtn = paymobPage.getByRole('button', { name: /pay with wallet|الدفع/i });
@@ -733,12 +734,30 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
     });
   }
 
-  // Wait for a terminal state: URL change (success) or error text on page (failure)
-  const outcome = await waitForPaymobOutcome(paymobPage, preClickUrl, preClickError);
+  // Race two signals: PayerMax/Midasbuy's redirect (UI signal) and the Vodafone
+  // payment confirmation SMS (money-moved signal — authoritative).
+  const [outcome, paymentSms] = await Promise.all([
+    waitForPaymobOutcome(paymobPage, preClickUrl, preClickError),
+    waitForPaymentSms(config, expectedAmount, clickedAt),
+  ]);
   await takeScreenshot(paymobPage, 'phase7-after-pay');
 
+  if (paymentSms) {
+    log('phase-7',
+      `✅ Vodafone SMS confirmed payment: txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
+    // Machine-parsable line for the trigger-worker to capture.
+    console.log(`PAYMENT_CONFIRMED txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
+    if (outcome.kind === 'success') {
+      log('phase-7', `Merchant UI also confirmed success → ${paymobPage.url()}`);
+    } else {
+      log('phase-7',
+        `⚠️ DELIVERY VERIFICATION NEEDED — Vodafone debited but merchant UI reported ${outcome.kind}: ${outcome.message || paymobPage.url()}`);
+    }
+    return;
+  }
+
   if (outcome.kind === 'success') {
-    log('phase-7', `Paymob completed → redirected to ${paymobPage.url()}`);
+    log('phase-7', `Paymob completed → redirected to ${paymobPage.url()} (no SMS within ${config.paymentSmsTimeoutMs}ms)`);
     return;
   }
 
@@ -750,6 +769,50 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
   }
   log('phase-7', `Paymob did not redirect or show error within 30s. URL: ${paymobPage.url()}`);
   throw new Error('Paymob did not reach a terminal state within 30s after clicking Pay');
+}
+
+async function waitForPaymentSms(
+  config: PurchaseConfig,
+  expectedAmount: number,
+  sinceMs: number,
+): Promise<{ amount: number; merchant: string; txnId: string } | null> {
+  if (!config.otpReceiverUrl || !config.otpReceiverToken) return null;
+  const amountParam = Number.isFinite(expectedAmount) ? `&amount=${expectedAmount}` : '';
+  const merchantParam = `&merchant=${encodeURIComponent(config.merchantName)}`;
+  const url = `${config.otpReceiverUrl}/payment/wait?since=${sinceMs}&timeout=${config.paymentSmsTimeoutMs}${amountParam}${merchantParam}`;
+  try {
+    const res = await fetch(url, {
+      headers: { 'X-Token': config.otpReceiverToken },
+      signal: AbortSignal.timeout(config.paymentSmsTimeoutMs + 5000),
+    });
+    if (!res.ok) {
+      if (res.status === 404) {
+        log('phase-7', 'Payment SMS endpoint not deployed yet (receiver returned 404) — skipping SMS check');
+        return null;
+      }
+      if (res.status === 408) {
+        log('phase-7', 'Payment SMS timeout — no matching SMS received within window');
+        return null;
+      }
+      log('phase-7', `Payment SMS receiver returned ${res.status}`);
+      return null;
+    }
+    const body = (await res.json()) as {
+      ok?: boolean;
+      amount?: number;
+      merchant?: string;
+      txn_id?: string;
+    };
+    if (!body.ok || !body.txn_id) return null;
+    return {
+      amount: body.amount ?? NaN,
+      merchant: body.merchant ?? '',
+      txnId: body.txn_id,
+    };
+  } catch (err) {
+    log('phase-7', `Payment SMS receiver error: ${err}`);
+    return null;
+  }
 }
 
 async function fillAndVerifyPaymob(page: Page, kind: 'pin' | 'otp', value: string): Promise<void> {

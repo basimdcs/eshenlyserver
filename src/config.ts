@@ -18,6 +18,8 @@ export interface PurchaseConfig {
   otpReceiverUrl: string;
   otpReceiverToken: string;
   otpTimeoutMs: number;
+  merchantName: string;
+  paymentSmsTimeoutMs: number;
 }
 
 export function parseArgs(): PurchaseConfig {
@@ -35,7 +37,9 @@ export function parseArgs(): PurchaseConfig {
     .option('--wallet-pin <pin>', 'Vodafone Cash wallet PIN', process.env.WALLET_PIN)
     .option('--otp-receiver-url <url>', 'OTP receiver base URL', process.env.OTP_RECEIVER_URL || 'http://localhost:8787')
     .option('--otp-receiver-token <token>', 'OTP receiver auth token', process.env.OTP_RECEIVER_TOKEN)
-    .option('--otp-timeout <ms>', 'OTP wait timeout in ms', process.env.OTP_TIMEOUT_MS || '180000');
+    .option('--otp-timeout <ms>', 'OTP wait timeout in ms', process.env.OTP_TIMEOUT_MS || '180000')
+    .option('--merchant-name <name>', 'Merchant name in Vodafone payment SMS', process.env.MERCHANT_NAME || 'MidasbuyPayermax')
+    .option('--payment-sms-timeout <ms>', 'How long to wait for Vodafone payment confirmation SMS', process.env.PAYMENT_SMS_TIMEOUT_MS || '45000');
 
   program.parse();
   const opts = program.opts();
@@ -53,5 +57,7 @@ export function parseArgs(): PurchaseConfig {
     otpReceiverUrl: opts.otpReceiverUrl,
     otpReceiverToken: opts.otpReceiverToken || '',
     otpTimeoutMs: parseInt(opts.otpTimeout, 10),
+    merchantName: opts.merchantName,
+    paymentSmsTimeoutMs: parseInt(opts.paymentSmsTimeout, 10),
   };
 }

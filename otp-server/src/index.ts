@@ -10,12 +10,27 @@ if (!TOKEN) {
 }
 
 type Entry = { otp: string; amount: number; ts: number; raw: string };
+type PaymentEntry = { amount: number; merchant: string; txnId: string; ts: number; raw: string };
 const recent: Entry[] = [];
+const recentPayments: PaymentEntry[] = [];
 const MAX_RECENT = 50;
 const ENTRY_TTL_MS = 10 * 60 * 1000;
 
 function log(tag: string, msg: string): void {
   console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
+}
+
+function parsePayment(text: string): { amount: number; merchant: string; txnId: string } | null {
+  // Vodafone Cash payment confirmation SMS, e.g.:
+  // "تم دفع مبلغ 93.0جنية لCarry1st. رصيد محفظتك الحالي 1625.76 جنيه.
+  //  رقم العملية 020176427512 تاريخ العملية 21-05-26 13:41."
+  const amt = text.match(/تم\s*دفع\s*مبلغ\s*([\d.]+)\s*جني[هة]\s*ل\s*([^\s.,]+)/);
+  if (!amt) return null;
+  const amount = parseFloat(amt[1]);
+  const merchant = amt[2];
+  const tx = text.match(/رقم\s*العملية\s*(\d+)/);
+  if (!Number.isFinite(amount) || !merchant || !tx) return null;
+  return { amount, merchant, txnId: tx[1] };
 }
 
 function parseOtp(text: string): { otp: string; amount: number } | null {
@@ -40,6 +55,7 @@ function parseOtp(text: string): { otp: string; amount: number } | null {
 function pruneOld(): void {
   const cutoff = Date.now() - ENTRY_TTL_MS;
   while (recent.length > 0 && recent[0].ts < cutoff) recent.shift();
+  while (recentPayments.length > 0 && recentPayments[0].ts < cutoff) recentPayments.shift();
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -74,17 +90,83 @@ async function handlePost(req: http.IncomingMessage, res: http.ServerResponse): 
       // fall through to raw
     }
   }
+  pruneOld();
+
+  // Try payment confirmation first — it's a strict pattern that wouldn't accidentally match an OTP SMS.
+  const payment = parsePayment(text);
+  if (payment) {
+    recentPayments.push({
+      amount: payment.amount,
+      merchant: payment.merchant,
+      txnId: payment.txnId,
+      ts: Date.now(),
+      raw: text.slice(0, 200),
+    });
+    while (recentPayments.length > MAX_RECENT) recentPayments.shift();
+    log('post', `stored PAYMENT amount=${payment.amount} merchant=${payment.merchant} txn=${payment.txnId}`);
+    res.writeHead(200, { 'content-type': 'application/json' }).end(
+      JSON.stringify({ ok: true, matched: true, kind: 'payment', ...payment })
+    );
+    return;
+  }
+
   const parsed = parseOtp(text);
   if (!parsed) {
-    log('post', `no OTP found in: ${text.slice(0, 120)}`);
+    log('post', `no OTP/payment found in: ${text.slice(0, 120)}`);
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, matched: false }));
     return;
   }
-  pruneOld();
   recent.push({ otp: parsed.otp, amount: parsed.amount, ts: Date.now(), raw: text.slice(0, 200) });
   while (recent.length > MAX_RECENT) recent.shift();
   log('post', `stored OTP ${parsed.otp} amount=${parsed.amount}`);
-  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, matched: true, otp: parsed.otp, amount: parsed.amount }));
+  res.writeHead(200, { 'content-type': 'application/json' }).end(
+    JSON.stringify({ ok: true, matched: true, kind: 'otp', otp: parsed.otp, amount: parsed.amount })
+  );
+}
+
+async function handlePaymentWait(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (!authOk(req)) {
+    res.writeHead(401).end('unauthorized');
+    return;
+  }
+  const url = new URL(req.url!, 'http://x');
+  const amount = parseFloat(url.searchParams.get('amount') || 'NaN');
+  const merchantFilter = (url.searchParams.get('merchant') || '').trim();
+  const sinceMs = parseInt(url.searchParams.get('since') || '0', 10);
+  const timeoutMs = Math.min(parseInt(url.searchParams.get('timeout') || '30000', 10), 120000);
+
+  const start = Date.now();
+  pruneOld();
+
+  const tryFind = (): PaymentEntry | null => {
+    pruneOld();
+    for (let i = recentPayments.length - 1; i >= 0; i--) {
+      const e = recentPayments[i];
+      if (e.ts < sinceMs) continue;
+      if (Number.isFinite(amount) && Math.abs(e.amount - amount) > 0.01) continue;
+      if (merchantFilter && !e.merchant.toLowerCase().includes(merchantFilter.toLowerCase())) continue;
+      return e;
+    }
+    return null;
+  };
+
+  while (Date.now() - start < timeoutMs) {
+    const hit = tryFind();
+    if (hit) {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          ok: true,
+          amount: hit.amount,
+          merchant: hit.merchant,
+          txn_id: hit.txnId,
+          ts: hit.ts,
+        })
+      );
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  res.writeHead(408, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'timeout' }));
 }
 
 async function handleWait(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -134,6 +216,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/otp/wait') {
       await handleWait(req, res);
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/payment/wait') {
+      await handlePaymentWait(req, res);
       return;
     }
     if (req.method === 'GET' && url.pathname === '/health') {

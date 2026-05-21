@@ -1,18 +1,32 @@
 export interface OrderParams {
-  playerId: string;
+  url: string;
   bundleLabel: string;
-  countryCode: string;
   paymentMethod: string;
+  fields: Record<string, string>;
+}
+
+export interface ContactDetails {
   firstName: string;
   surname: string;
   email: string;
   phone: string;
-  dialCode: string;
+}
+
+export interface WalletAutomation {
+  walletPin?: string;
+  otpReceiverUrl?: string;
+  otpReceiverToken?: string;
+  otpTimeoutMs: number;
+  merchantName: string;
+  paymentSmsTimeoutMs: number;
 }
 
 export interface BotConfig {
   headless: boolean;
   proxy?: string;
+  stopBeforeBuy: boolean;
+  stopBeforePay: boolean;
+  stopAfterPay: boolean;
 }
 
-export interface FullConfig extends OrderParams, BotConfig {}
+export interface FullConfig extends OrderParams, ContactDetails, BotConfig, WalletAutomation {}

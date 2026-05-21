@@ -14,6 +14,8 @@ export class Carry1stBot {
   private browser!: Browser;
   private page!: Page;
   private config: FullConfig;
+  private purchaseStartedAt: number = 0;
+  private expectedAmount: number = NaN;
 
   constructor(config: FullConfig) {
     this.config = config;
@@ -35,15 +37,13 @@ export class Carry1stBot {
   }
 
   async navigateToProduct() {
-    const url = `https://shop.carry1st.com/en/${this.config.countryCode}/product/pubg-mobile-uc-top-up-gm/direct-topup`;
-    log("Navigating", url);
-    await this.page.goto(url, { waitUntil: "networkidle" });
+    log("Navigating", this.config.url);
+    await this.page.goto(this.config.url, { waitUntil: "networkidle" });
     await sleep(2000);
   }
 
   async dismissPopups() {
     log("Dismissing popups");
-    // Country detection dialog — click the X/close button
     try {
       const closeBtn = this.page.locator(
         'button:has-text("Continue"), [aria-label="Close"], button:has-text("×"), dialog button'
@@ -59,14 +59,17 @@ export class Carry1stBot {
     }
   }
 
-  async enterPlayerId() {
-    log("Entering Player ID", this.config.playerId);
-    const input = this.page.locator(
-      'input[placeholder*="Player ID"], input[name="Player ID"], input[placeholder*="player"]'
-    );
-    await input.first().waitFor({ state: "visible", timeout: 10000 });
-    await input.first().fill(this.config.playerId);
-    await sleep(1500);
+  async fillProductFields() {
+    const entries = Object.entries(this.config.fields);
+    if (entries.length === 0) {
+      log("No product fields to fill (gift-card style)");
+      return;
+    }
+    log("Filling product fields", entries.map(([k]) => k).join(", "));
+    for (const [label, value] of entries) {
+      await this.fillField(label, value);
+      await sleep(1000);
+    }
   }
 
   async selectBundle() {
@@ -74,7 +77,33 @@ export class Carry1stBot {
     const bundleBtn = this.page
       .locator("button, div[role='button'], label")
       .filter({ hasText: this.config.bundleLabel });
-    await bundleBtn.first().waitFor({ state: "visible", timeout: 10000 });
+    try {
+      await bundleBtn.first().waitFor({ state: "visible", timeout: 5000 });
+    } catch {
+      // Bundle may be behind a "Show more products" expander.
+      const showMore = this.page.locator('button, div[role="button"]').filter({ hasText: "Show more products" });
+      if (await showMore.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+        log("Bundle not visible — clicking 'Show more products' to expand");
+        await showMore.first().click();
+        await sleep(1500);
+      }
+    }
+    try {
+      await bundleBtn.first().waitFor({ state: "visible", timeout: 8000 });
+    } catch (err) {
+      log("Bundle not found — dumping all bundle-like candidates");
+      const candidates = await this.page.evaluate(() => {
+        const els = Array.from(
+          document.querySelectorAll("button, div[role='button'], label")
+        );
+        return els
+          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
+          .filter((t) => t.length > 0 && t.length < 200)
+          .filter((t, i, arr) => arr.indexOf(t) === i);
+      });
+      log("Candidate button texts", JSON.stringify(candidates, null, 2));
+      throw err;
+    }
     await bundleBtn.first().click();
     await sleep(1500);
   }
@@ -92,28 +121,22 @@ export class Carry1stBot {
   async fillContactDetails() {
     log("Filling contact details");
     const { firstName, surname, email, phone } = this.config;
-
-    if (!firstName || !surname || !email || !phone) {
-      throw new Error(
-        "Contact details (FIRST_NAME, SURNAME, EMAIL, PHONE) are all required in .env"
-      );
-    }
-
-    // Fill each field
     await this.fillField("First name", firstName);
     await this.fillField("Surname", surname);
     await this.fillField("Email", email);
     await this.fillField("Phone number", phone);
-
     await sleep(1000);
   }
 
   private async fillField(label: string, value: string) {
-    // Try multiple strategies to find the field
+    // Exact-match strategies first so "Email" doesn't match "Valid Email for Voucher".
     const strategies = [
+      () => this.page.getByLabel(label, { exact: true }),
+      () => this.page.getByPlaceholder(label, { exact: true }),
+      () => this.page.locator(`input[aria-label="${label}"]`),
+      () => this.page.locator(`input[name="${label}"]`),
       () => this.page.getByLabel(label),
       () => this.page.getByPlaceholder(label),
-      () => this.page.locator(`input[name="${label}"]`),
       () => this.page.locator(`input[placeholder*="${label}"]`),
     ];
     for (const strategy of strategies) {
@@ -128,7 +151,6 @@ export class Carry1stBot {
         }
       } catch {}
     }
-    // Debug: dump all visible inputs
     const inputs = await this.page.locator("input:visible").all();
     const attrs = [];
     for (const inp of inputs) {
@@ -143,14 +165,56 @@ export class Carry1stBot {
 
   async clickBuyNow() {
     log("Clicking BUY NOW");
+    this.purchaseStartedAt = Date.now();
     const buyBtn = this.page.locator('button:has-text("BUY NOW")');
     await buyBtn.first().waitFor({ state: "visible", timeout: 10000 });
+
+    // Diagnostic: if disabled, dump form state before timing out.
+    const isDisabled = await buyBtn.first().isDisabled().catch(() => false);
+    if (isDisabled) {
+      log("BUY NOW is disabled — dumping form state");
+      const state = await this.page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll("input")).map((i) => ({
+          name: i.getAttribute("name"),
+          placeholder: i.getAttribute("placeholder"),
+          ariaLabel: i.getAttribute("aria-label"),
+          type: i.type,
+          value: i.value,
+          required: i.required,
+          checked: i.type === "radio" || i.type === "checkbox" ? i.checked : undefined,
+        }));
+        const buyBtn = document.querySelector("button:has(span)") as HTMLElement | null;
+        const buyText =
+          Array.from(document.querySelectorAll("button")).find((b) =>
+            (b.textContent || "").includes("BUY NOW")
+          ) || buyBtn;
+        return { inputs, buyHtml: buyText?.outerHTML?.slice(0, 400) || null };
+      });
+      log("Form inputs", JSON.stringify(state.inputs, null, 2));
+      if (state.buyHtml) log("BUY NOW button HTML", state.buyHtml);
+    }
+
     await buyBtn.first().click();
 
     log("Waiting for redirect to pay.carry1st.com");
     await this.page.waitForURL("**/pay.carry1st.com/**", { timeout: 30000 });
     log("Redirected to payment page", this.page.url());
     await sleep(2000);
+
+    // Capture amount from the Pay1st summary so the OTP receiver can match it.
+    try {
+      const amount = await this.page.evaluate(() => {
+        const text = document.body.innerText || "";
+        const m = text.match(/EGP\s*([\d,]+\.?\d*)/i);
+        return m ? parseFloat(m[1].replace(/,/g, "")) : NaN;
+      });
+      if (Number.isFinite(amount)) {
+        this.expectedAmount = amount;
+        log("Expected charge amount", `${amount} EGP`);
+      } else {
+        log("Warning", "could not parse amount from Pay1st page");
+      }
+    } catch {}
   }
 
   async confirmPayment() {
@@ -158,41 +222,394 @@ export class Carry1stBot {
     await sleep(5000);
 
     // Playwright reports the Pay Now button as "not visible" due to CSS framework quirks.
-    // Use JS click directly to bypass visibility checks.
+    // Use JS click directly to bypass visibility checks. Pay1st may render in
+    // Arabic ("ادفع الآن") even when shop locale is en — try both languages.
+    // Inline to avoid tsx wrapping nested arrow fns with `__name` (which is
+    // undefined in the browser context).
     await this.page.evaluate(() => {
-      const btn = document.querySelector('button[aria-label="Pay Now"]') as HTMLButtonElement;
-      if (btn) {
-        btn.click();
-      } else {
-        // Fallback: find by text
+      let btn = document.querySelector('button[aria-label="Pay Now"]') as HTMLButtonElement | null;
+      if (!btn) btn = document.querySelector('button[aria-label="ادفع الآن"]') as HTMLButtonElement | null;
+      if (!btn) {
         const buttons = Array.from(document.querySelectorAll("button"));
-        const payBtn = buttons.find((b) => b.textContent?.trim() === "Pay Now");
-        if (payBtn) payBtn.click();
-        else throw new Error("Pay Now button not found in DOM");
+        for (const b of buttons) {
+          const t = (b.textContent || "").trim();
+          if (t === "Pay Now" || t === "ادفع الآن" || t.indexOf("ادفع") >= 0) {
+            btn = b as HTMLButtonElement;
+            break;
+          }
+        }
       }
+      if (!btn) throw new Error("Pay Now button not found in DOM");
+      btn.click();
     });
     log("Clicked Pay Now");
   }
 
-  async waitForResult() {
-    log(
-      "Waiting for payment result",
-      "Check your phone for OTP (5 min timeout)"
-    );
+  async payWithWallet() {
+    if (!this.config.walletPin) {
+      log("payWithWallet skipped", "WALLET_PIN not set");
+      return;
+    }
+
+    log("Waiting for Paymob/Vodafone Cash checkout window...");
+    const paymobPage = await this.resolvePaymobPage();
+    if (!paymobPage) throw new Error("Paymob checkout did not appear within 45s");
+
     try {
-      // After Pay Now, the page may navigate or a new tab may open
-      // Check for new pages (popups/tabs)
+      await paymobPage.waitForLoadState("domcontentloaded", { timeout: 15000 });
+      await paymobPage.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    } catch {}
+
+    log("Paymob URL", paymobPage.url());
+    try {
+      await paymobPage.screenshot({ path: "paymob-loaded.png", fullPage: true });
+    } catch {}
+
+    if (Number.isFinite(this.expectedAmount)) {
+      log("Expected amount (from Pay1st)", `${this.expectedAmount} EGP`);
+    }
+
+    await this.fillAndVerifyPaymob(paymobPage, "pin", this.config.walletPin);
+    log("PIN entered and verified");
+
+    log("Polling OTP receiver", `timeout ${Math.round(this.config.otpTimeoutMs / 1000)}s`);
+    const otp = await this.waitForOtp();
+    if (!otp) {
+      try { await paymobPage.screenshot({ path: "paymob-otp-timeout.png", fullPage: true }); } catch {}
+      throw new Error("OTP not received within timeout");
+    }
+    log("OTP received", otp);
+
+    await this.fillAndVerifyPaymob(paymobPage, "otp", otp);
+    log("OTP entered and verified");
+    try { await paymobPage.screenshot({ path: "paymob-before-pay.png", fullPage: true }); } catch {}
+
+    const preClickUrl = paymobPage.url();
+    const preClickError = await this.readPaymobErrorText(paymobPage);
+    const clickedAt = Date.now();
+
+    log("Clicking 'Pay with Wallet'");
+    const payBtn = paymobPage.getByRole("button", { name: /pay with wallet|الدفع/i });
+    try {
+      await payBtn.waitFor({ state: "visible", timeout: 5000 });
+      await payBtn.click();
+    } catch {
+      log("Pay with Wallet not found by role — fallback");
+      await paymobPage.evaluate(() => {
+        const btns = document.querySelectorAll('button, input[type="submit"]');
+        for (const b of Array.from(btns)) {
+          const txt = (b as HTMLElement).innerText || (b as HTMLInputElement).value || "";
+          if (/pay|wallet|دفع/i.test(txt)) {
+            (b as HTMLElement).click();
+            return;
+          }
+        }
+      });
+    }
+
+    // Race two signals: Carry1st's redirect (UI signal) and the Vodafone payment
+    // confirmation SMS (money-moved signal — authoritative). Carry1st sometimes
+    // redirects to /payment/failure even when the wallet was actually debited.
+    const [urlOutcome, paymentSms] = await Promise.all([
+      this.waitForPaymobOutcome(paymobPage, preClickUrl, preClickError),
+      this.waitForPaymentSms(clickedAt),
+    ]);
+    try { await paymobPage.screenshot({ path: "paymob-after-pay.png", fullPage: true }); } catch {}
+
+    if (paymentSms) {
+      log("✅ Vodafone SMS confirmed payment",
+        `txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
+      // Machine-parsable line for the trigger-worker to capture.
+      console.log(`PAYMENT_CONFIRMED txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
+      if (urlOutcome.kind === "success") {
+        log("✅ Merchant UI also confirmed success", paymobPage.url());
+      } else {
+        log("⚠️ DELIVERY VERIFICATION NEEDED",
+          `Vodafone debited but merchant UI reported ${urlOutcome.kind}: ${urlOutcome.message || paymobPage.url()}`);
+      }
+      return;
+    }
+
+    // No payment SMS arrived — fall back to URL signal.
+    if (urlOutcome.kind === "success") {
+      log("⚠️ UI says success but no Vodafone SMS yet", "treating as success but flag for follow-up");
+      return;
+    }
+    if (urlOutcome.kind === "error") {
+      throw new Error(`Paymob rejected payment: ${urlOutcome.message}`);
+    }
+    throw new Error(`No payment SMS within ${this.config.paymentSmsTimeoutMs}ms and no URL settlement. URL: ${paymobPage.url()}`);
+  }
+
+  private async waitForPaymentSms(
+    sinceMs: number
+  ): Promise<{ amount: number; merchant: string; txnId: string } | null> {
+    if (!this.config.otpReceiverUrl || !this.config.otpReceiverToken) return null;
+    const amountParam = Number.isFinite(this.expectedAmount)
+      ? `&amount=${this.expectedAmount}`
+      : "";
+    const merchantParam = `&merchant=${encodeURIComponent(this.config.merchantName)}`;
+    const url = `${this.config.otpReceiverUrl}/payment/wait?since=${sinceMs}&timeout=${this.config.paymentSmsTimeoutMs}${amountParam}${merchantParam}`;
+    try {
+      const res = await fetch(url, {
+        headers: { "X-Token": this.config.otpReceiverToken },
+        signal: AbortSignal.timeout(this.config.paymentSmsTimeoutMs + 5000),
+      });
+      if (!res.ok) {
+        if (res.status === 404) {
+          log("Payment SMS endpoint not deployed yet", "(receiver returned 404) — skipping SMS check");
+          return null;
+        }
+        if (res.status === 408) {
+          log("Payment SMS timeout", "no matching SMS received");
+          return null;
+        }
+        log("Payment SMS receiver returned", String(res.status));
+        return null;
+      }
+      const body = (await res.json()) as {
+        ok?: boolean;
+        amount?: number;
+        merchant?: string;
+        txn_id?: string;
+      };
+      if (!body.ok || !body.txn_id) return null;
+      return {
+        amount: body.amount ?? NaN,
+        merchant: body.merchant ?? "",
+        txnId: body.txn_id,
+      };
+    } catch (err) {
+      log("Payment SMS receiver error", String(err));
+      return null;
+    }
+  }
+
+  private async resolvePaymobPage(): Promise<Page | null> {
+    const ctx = this.page.context();
+    const isPaymob = (p: Page) =>
+      /vcheckout\.paymob(solutions)?\.com\/checkout/i.test(p.url());
+
+    // 1. Already on Paymob in current tab (Carry1st flow navigates in-place).
+    if (isPaymob(this.page)) return this.page;
+
+    // 2. Other open tab is on Paymob.
+    const existing = ctx.pages().find(isPaymob);
+    if (existing) return existing;
+
+    // 3. Wait for either a new tab OR a navigation in the current tab.
+    const newTabP = ctx.waitForEvent("page", { timeout: 45000, predicate: isPaymob }).catch(() => null);
+    const navP = this.page
+      .waitForURL((u) => /vcheckout\.paymob(solutions)?\.com\/checkout/i.test(u.toString()), { timeout: 45000 })
+      .then(() => this.page)
+      .catch(() => null);
+    const winner = await Promise.race([newTabP, navP]);
+    return winner;
+  }
+
+  private async fillAndVerifyPaymob(page: Page, kind: "pin" | "otp", value: string) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.fillPaymobInput(page, kind, value);
+      await page.waitForTimeout(300);
+      const ok = await page.evaluate(
+        ({ kind, expectedLen }: { kind: "pin" | "otp"; expectedLen: number }) => {
+          const inputs = Array.from(
+            document.querySelectorAll<HTMLInputElement>("input:not([readonly]):not([disabled])")
+          ).filter((i) => !/^\d{10,12}$/.test(i.value));
+          const idx = kind === "pin" ? 0 : 1;
+          const inp = inputs[idx];
+          return inp ? inp.value.length === expectedLen : false;
+        },
+        { kind, expectedLen: value.length }
+      );
+      if (ok) return;
+      log(`${kind} fill verification failed`, `attempt ${attempt + 1}/3`);
+    }
+    throw new Error(`Failed to enter ${kind} into Paymob form after 3 attempts`);
+  }
+
+  private async fillPaymobInput(page: Page, kind: "pin" | "otp", value: string) {
+    // Locate input by walking up the DOM looking for the matching label (handles
+    // Arabic + English) and skipping the pre-filled wallet-number input.
+    const handle = await page.evaluateHandle((kind: "pin" | "otp") => {
+      const labelPattern = kind === "pin"
+        ? /الرقم السري للمحفظة|PIN/i
+        : /الرقم السري المتغير|OTP/i;
+      const excludePattern = kind === "pin"
+        ? /الرقم السري المتغير|OTP/i
+        : /الرقم السري للمحفظة|PIN/i;
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLInputElement>("input:not([readonly]):not([disabled])")
+      ).filter((i) => !/^\d{10,12}$/.test(i.value));
+      for (const inp of candidates) {
+        let el: Element | null = inp.parentElement;
+        let depth = 0;
+        while (el && depth < 6) {
+          const text = (el.textContent || "").trim();
+          if (labelPattern.test(text) && !excludePattern.test(text)) {
+            return inp;
+          }
+          el = el.parentElement;
+          depth++;
+        }
+      }
+      return null;
+    }, kind);
+
+    const element = handle.asElement();
+    if (element) {
+      await element.scrollIntoViewIfNeeded().catch(() => {});
+      await element.click({ delay: 30 });
+      await page.keyboard.press("ControlOrMeta+a").catch(() => {});
+      await page.keyboard.press("Delete").catch(() => {});
+      await page.keyboard.type(value, { delay: 60 });
+      return;
+    }
+
+    // Fallback by index (PIN = 0, OTP = 1) among non-readonly inputs.
+    const inputs = page.locator("input:not([readonly]):not([disabled])");
+    const idx = kind === "pin" ? 0 : 1;
+    const target = inputs.nth(idx);
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await target.click({ delay: 30 });
+    await page.keyboard.press("ControlOrMeta+a").catch(() => {});
+    await page.keyboard.press("Delete").catch(() => {});
+    await page.keyboard.type(value, { delay: 60 });
+  }
+
+  private async waitForOtp(): Promise<string | null> {
+    if (!this.config.otpReceiverUrl || !this.config.otpReceiverToken) {
+      log("OTP receiver not configured", "OTP_RECEIVER_URL / OTP_RECEIVER_TOKEN");
+      return null;
+    }
+    const amountParam = Number.isFinite(this.expectedAmount)
+      ? `&amount=${this.expectedAmount}`
+      : "";
+    const url = `${this.config.otpReceiverUrl}/otp/wait?since=${this.purchaseStartedAt}&timeout=${this.config.otpTimeoutMs}${amountParam}`;
+    try {
+      const res = await fetch(url, {
+        headers: { "X-Token": this.config.otpReceiverToken },
+        signal: AbortSignal.timeout(this.config.otpTimeoutMs + 5000),
+      });
+      if (!res.ok) {
+        log("OTP receiver returned", String(res.status));
+        return null;
+      }
+      const body = (await res.json()) as { otp?: string };
+      return body.otp || null;
+    } catch (err) {
+      log("OTP receiver error", String(err));
+      return null;
+    }
+  }
+
+  private async waitForPaymobOutcome(
+    page: Page,
+    initialUrl: string,
+    preClickError: string | null
+  ): Promise<{ kind: "success" | "error" | "timeout"; message?: string }> {
+    const start = Date.now();
+    while (Date.now() - start < 30_000) {
+      const currentUrl = page.url();
+      if (
+        currentUrl !== initialUrl &&
+        !/vcheckout\.paymob(solutions)?\.com\/checkout/i.test(currentUrl)
+      ) {
+        await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+        const finalUrl = page.url();
+        const pm = finalUrl.match(/[?&]success=(true|false)\b/i);
+        if (pm) {
+          if (pm[1].toLowerCase() === "true") return { kind: "success" };
+          const errMatch = finalUrl.match(/[?&]data\.message=([^&]+)/);
+          return {
+            kind: "error",
+            message: `Paymob declined: ${errMatch ? decodeURIComponent(errMatch[1]) : finalUrl}`,
+          };
+        }
+        // Carry1st may redirect to its own /success or /failure path.
+        if (/success|complete|paid|thank/i.test(finalUrl)) return { kind: "success" };
+        if (/fail|cancel|decline|error/i.test(finalUrl)) {
+          return { kind: "error", message: `Merchant reported failure: ${finalUrl}` };
+        }
+        // Unknown destination — log and assume success (Paymob only navigates on success).
+        return { kind: "success" };
+      }
+      let errorText: string | null = null;
+      try {
+        errorText = await this.readPaymobErrorText(page);
+      } catch (err) {
+        if (/Execution context was destroyed|Target closed|frame was detached/i.test(String(err))) {
+          await page.waitForTimeout(500);
+          continue;
+        }
+        throw err;
+      }
+      if (errorText && errorText !== preClickError) {
+        return { kind: "error", message: errorText };
+      }
+      await page.waitForTimeout(500);
+    }
+    return { kind: "timeout" };
+  }
+
+  private async readPaymobErrorText(page: Page): Promise<string | null> {
+    return page.evaluate(() => {
+      const candidates: Element[] = [];
+      candidates.push(
+        ...Array.from(
+          document.querySelectorAll(
+            '[class*="error" i], [class*="invalid" i], [class*="alert" i], [class*="fail" i], [role="alert"]'
+          )
+        )
+      );
+      document.querySelectorAll("p, div, span, label, small, strong").forEach((el) => {
+        const text = el.textContent?.trim() || "";
+        if (text.length < 4 || text.length > 300) return;
+        const cs = window.getComputedStyle(el as HTMLElement);
+        const m = cs.color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+        if (m) {
+          const r = parseInt(m[1], 10);
+          const g = parseInt(m[2], 10);
+          const b = parseInt(m[3], 10);
+          if (r > 150 && g < 100 && b < 100) candidates.push(el);
+        }
+      });
+      for (const c of candidates) {
+        const text = c.textContent?.trim() || "";
+        if (text.length >= 4 && text.length <= 300 && !/checkout|wallet/i.test(text)) {
+          return text;
+        }
+      }
+      return null;
+    });
+  }
+
+  async snapshotAllPages(prefix: string) {
+    const context = this.page.context();
+    // Brief settle so newly-opened tabs finish loading.
+    await sleep(8000);
+    const pages = context.pages();
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+      try {
+        await p.screenshot({ path: `${prefix}-${i}.png`, fullPage: true });
+        log("Screenshot saved", `${prefix}-${i}.png — url: ${p.url()}`);
+      } catch (err) {
+        log(`Screenshot failed for tab ${i}`, String(err));
+      }
+    }
+  }
+
+  async waitForResult() {
+    log("Waiting for payment result", "Check your phone for OTP (5 min timeout)");
+    try {
       const context = this.page.context();
       const pages = context.pages();
-      const activePage = pages[pages.length - 1]; // Use the latest page/tab
-
-      // Listen for new pages that may open
+      const activePage = pages[pages.length - 1];
       context.on("page", (newPage) => {
         log("New tab opened", newPage.url());
         this.page = newPage;
       });
-
-      // Wait for navigation or URL change indicating result
       await activePage.waitForEvent("close", { timeout: 300000 }).catch(() => {});
       log("Payment flow completed", "Check browser for final status");
     } catch {
@@ -205,25 +622,49 @@ export class Carry1stBot {
     try {
       await this.navigateToProduct();
       await this.dismissPopups();
-      await this.enterPlayerId();
+      await this.fillProductFields();
       await this.selectBundle();
       await this.selectPaymentMethod();
       await this.fillContactDetails();
+      if (this.config.stopBeforeBuy) {
+        log("STOP-BEFORE-BUY", "All fields filled. BUY NOW not clicked. No payment triggered.");
+        try {
+          await this.page.screenshot({ path: "pre-buy-screenshot.png", fullPage: true });
+          log("Screenshot saved", "pre-buy-screenshot.png");
+        } catch {}
+        return;
+      }
       await this.clickBuyNow();
+      if (this.config.stopBeforePay) {
+        log("STOP-BEFORE-PAY", "On pay.carry1st.com. Pay Now NOT clicked. No OTP sent.");
+        try {
+          await this.page.screenshot({ path: "pre-pay-screenshot.png", fullPage: true });
+          log("Screenshot saved", "pre-pay-screenshot.png");
+        } catch {}
+        return;
+      }
       await this.confirmPayment();
-      await this.waitForResult();
+      if (this.config.stopAfterPay) {
+        log("STOP-AFTER-PAY", "Pay Now clicked. Snapshotting OTP/PIN page(s)...");
+        await this.snapshotAllPages("post-pay-screenshot");
+        return;
+      }
+      if (this.config.walletPin) {
+        await this.payWithWallet();
+      } else {
+        await this.waitForResult();
+      }
     } catch (err: any) {
       log("ERROR", err.message);
-      // Take a screenshot for debugging
       try {
-        await this.page.screenshot({ path: "error-screenshot.png" });
+        await this.page.screenshot({ path: "error-screenshot.png", fullPage: true });
         log("Screenshot saved", "error-screenshot.png");
       } catch {}
       throw err;
     } finally {
       if (!this.config.headless) {
         log("Keeping browser open for inspection. Press Ctrl+C to exit.");
-        await sleep(600000); // 10 min
+        await sleep(600000);
       }
       await this.browser.close();
     }
