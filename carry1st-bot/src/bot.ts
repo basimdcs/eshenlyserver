@@ -25,7 +25,27 @@ export class Carry1stBot {
     log("Launching browser", this.config.headless ? "headless" : "headed");
     this.browser = await chromium.launch({
       headless: this.config.headless,
+      channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
+      executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
       proxy: this.config.proxy ? { server: this.config.proxy } : undefined,
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--no-first-run",
+        "--mute-audio",
+        "--single-process",
+        "--no-zygote",
+        "--renderer-process-limit=1",
+        "--disable-features=site-per-process,IsolateOrigins,TranslateUI",
+        "--js-flags=--max-old-space-size=384",
+      ],
     });
     const context = await this.browser.newContext({
       viewport: { width: 1280, height: 800 },
