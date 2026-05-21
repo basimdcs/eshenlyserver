@@ -2,7 +2,7 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import 'dotenv/config';
 import { hmacVerify } from './crypto';
-import { insertJob, findByOrderId, findById } from './db';
+import { insertPubgJob, insertCarry1stJob, findByOrderId, findById } from './db';
 
 const PORT = parseInt(process.env.TRIGGER_PORT || '8788', 10);
 const HOST = process.env.TRIGGER_HOST || '127.0.0.1';
@@ -105,7 +105,7 @@ async function handleTrigger(req: http.IncomingMessage, res: http.ServerResponse
   // Enqueue
   const jobId = crypto.randomUUID();
   try {
-    insertJob({
+    insertPubgJob({
       id: jobId,
       order_id: idemHeader,
       player_id: payload.player_id,
@@ -126,6 +126,103 @@ async function handleTrigger(req: http.IncomingMessage, res: http.ServerResponse
   }
 
   log('queued', `order=${idemHeader} player=${payload.player_id} sku=${payload.sku} job=${jobId}`);
+  res.writeHead(202, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, job_id: jobId, status: 'queued' }));
+}
+
+async function handleTriggerCarry1st(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+
+  const tsHeader = req.headers['x-timestamp'];
+  const idemHeader = req.headers['x-idempotency-key'];
+  const sigHeader = req.headers['x-signature'];
+
+  if (typeof tsHeader !== 'string' || typeof idemHeader !== 'string' || typeof sigHeader !== 'string') {
+    return reject(res, 400, 'missing_headers', 'X-Timestamp, X-Idempotency-Key, X-Signature required');
+  }
+  const ts = parseInt(tsHeader, 10);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > TIMESTAMP_TOLERANCE_MS) {
+    return reject(res, 401, 'timestamp_invalid', `timestamp out of range (server now ${Date.now()})`);
+  }
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(idemHeader)) {
+    return reject(res, 400, 'idem_key_invalid');
+  }
+
+  const sigOk = hmacVerify(TRIGGER_SECRET, [String(ts), idemHeader, raw.toString('utf8')], sigHeader);
+  if (!sigOk) {
+    log('reject', `bad carry1st signature from ${req.socket.remoteAddress} idem=${idemHeader}`);
+    return reject(res, 401, 'signature_invalid');
+  }
+
+  let payload: {
+    url?: string;
+    bundle_label?: string;
+    fields?: Record<string, unknown>;
+    callback_url?: string;
+    customer_email?: string;
+  };
+  try {
+    payload = JSON.parse(raw.toString('utf8'));
+  } catch {
+    return reject(res, 400, 'body_invalid_json');
+  }
+
+  // Validation specific to Carry1st: URL must be on shop.carry1st.com,
+  // bundle_label non-empty, fields a plain string-keyed object.
+  if (!payload.url || !/^https:\/\/shop\.carry1st\.com\//.test(payload.url)) {
+    return reject(res, 400, 'url_invalid', 'url must be on https://shop.carry1st.com/');
+  }
+  if (!payload.bundle_label || typeof payload.bundle_label !== 'string' || payload.bundle_label.length > 200) {
+    return reject(res, 400, 'bundle_label_invalid');
+  }
+  if (!payload.fields || typeof payload.fields !== 'object' || Array.isArray(payload.fields)) {
+    return reject(res, 400, 'fields_invalid', 'fields must be a plain object');
+  }
+  const fieldsClean: Record<string, string> = {};
+  for (const [k, v] of Object.entries(payload.fields)) {
+    if (typeof k !== 'string' || typeof v !== 'string' || k.length > 100 || v.length > 200) {
+      return reject(res, 400, 'fields_invalid', `field "${k}" invalid`);
+    }
+    fieldsClean[k] = v;
+  }
+  if (!payload.callback_url || !/^https:\/\//i.test(payload.callback_url)) {
+    return reject(res, 400, 'callback_url_invalid', 'callback_url must be HTTPS');
+  }
+  if (payload.customer_email && payload.customer_email.length > 256) {
+    return reject(res, 400, 'customer_email_invalid');
+  }
+
+  const existing = findByOrderId(idemHeader);
+  if (existing) {
+    log('idempotent', `${idemHeader} → existing job ${existing.id} status=${existing.status}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, job_id: existing.id, status: existing.status, replay: true }));
+    return;
+  }
+
+  const jobId = crypto.randomUUID();
+  try {
+    insertCarry1stJob({
+      id: jobId,
+      order_id: idemHeader,
+      url: payload.url,
+      bundle_label: payload.bundle_label,
+      fields: fieldsClean,
+      callback_url: payload.callback_url,
+      customer_email: payload.customer_email || null,
+    });
+  } catch (err) {
+    const again = findByOrderId(idemHeader);
+    if (again) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, job_id: again.id, status: again.status, replay: true }));
+      return;
+    }
+    log('error', `carry1st insert failed: ${err}`);
+    return reject(res, 500, 'enqueue_failed');
+  }
+
+  log('queued', `carry1st order=${idemHeader} bundle="${payload.bundle_label}" job=${jobId}`);
   res.writeHead(202, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ ok: true, job_id: jobId, status: 'queued' }));
 }
@@ -154,6 +251,10 @@ const server = http.createServer(async (req, res) => {
     log('req', `${remote} ${req.method} ${url.pathname}`);
     if (req.method === 'POST' && url.pathname === '/trigger') {
       await handleTrigger(req, res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/trigger/carry1st') {
+      await handleTriggerCarry1st(req, res);
       return;
     }
     const m = url.pathname.match(/^\/jobs\/([a-f0-9-]{36})$/);

@@ -8,6 +8,7 @@ import { claimNextQueued, markFinished, recordCallbackAttempt, jobsNeedingCallba
 const CALLBACK_SECRET = process.env.CALLBACK_SECRET || '';
 const BOT_DIR = process.env.BOT_DIR || path.resolve(__dirname, '..', '..');
 const BOT_SCRIPT = path.join(BOT_DIR, 'bin', 'run-bot.sh');
+const CARRY1ST_BOT_DIR = process.env.CARRY1ST_BOT_DIR || path.resolve(__dirname, '..', '..', 'carry1st-bot');
 const POLL_INTERVAL_MS = 2000;
 const CALLBACK_RETRY_INTERVAL_MS = 30 * 1000;
 
@@ -20,26 +21,62 @@ function log(tag: string, msg: string): void {
   console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
 }
 
-function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: number | null; tradeToken: string | null; logFile: string }> {
+interface BotRunResult {
+  exitCode: number;
+  logTail: string;
+  amount: number | null;
+  tradeToken: string | null;
+  paymentTxnId: string | null;
+  logFile: string;
+}
+
+function runBot(job: Job): Promise<BotRunResult> {
   return new Promise((resolve) => {
-    const args = ['--player-id', job.player_id, '--sku', String(job.sku)];
+    const isCarry1st = job.bot_type === 'carry1st';
 
     // Per-job log file for full traceability (kept even on success)
     const logsDir = path.join(__dirname, '..', 'logs');
     fs.mkdirSync(logsDir, { recursive: true });
     const logFile = path.join(logsDir, `${job.id}.log`);
     const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-    logStream.write(`# job=${job.id} order=${job.order_id} player=${job.player_id} sku=${job.sku} started=${new Date().toISOString()}\n`);
+    logStream.write(`# job=${job.id} order=${job.order_id} bot_type=${job.bot_type} started=${new Date().toISOString()}\n`);
 
-    log('spawn', `${BOT_SCRIPT} ${args.join(' ')} → ${logFile}`);
-    const child = spawn(BOT_SCRIPT, args, {
-      cwd: BOT_DIR,
+    let cmd: string;
+    let args: string[];
+    let cwd: string;
+    if (isCarry1st) {
+      // Carry1st bot runs via tsx (no build step). Trigger-worker passes the
+      // per-job url/bundle/fields as CLI args; static config (PIN, OTP, merchant)
+      // comes from the worker's env.
+      cmd = 'npx';
+      args = [
+        'tsx',
+        'src/index.ts',
+        '--url', job.url || '',
+        '--bundle', job.bundle_label || '',
+        '--fields', job.fields_json || '{}',
+      ];
+      cwd = CARRY1ST_BOT_DIR;
+      logStream.write(`# url=${job.url} bundle="${job.bundle_label}" fields=${job.fields_json}\n`);
+    } else {
+      cmd = BOT_SCRIPT;
+      args = ['--player-id', job.player_id, '--sku', String(job.sku)];
+      cwd = BOT_DIR;
+      logStream.write(`# player=${job.player_id} sku=${job.sku}\n`);
+    }
+
+    log('spawn', `[${job.bot_type}] ${cmd} ${args.join(' ')} → ${logFile}`);
+    const child = spawn(cmd, args, {
+      cwd,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+
     const lines: string[] = [];
     let amount: number | null = null;
     let tradeToken: string | null = null;
+    let paymentTxnId: string | null = null;
+
     const capture = (chunk: Buffer) => {
       logStream.write(chunk);
       const text = chunk.toString('utf8');
@@ -47,12 +84,22 @@ function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: 
         if (!line.trim()) continue;
         lines.push(line);
         if (lines.length > 400) lines.shift();
-        const m1 = line.match(/Expected charge amount:\s*([\d.]+)/);
+        // PUBG: "Expected charge amount: 41.99"
+        // Carry1st: "Expected charge amount — 46.5 EGP"
+        const m1 = line.match(/Expected charge amount[:\s—-]+([\d.]+)/);
         if (m1) amount = parseFloat(m1[1]);
         const m2 = line.match(/Payment tab opened:\s*(\S+)/);
         if (m2) {
           const tk = m2[1].match(/[?&]tradeToken=([^&]+)/);
           if (tk) tradeToken = decodeURIComponent(tk[1]);
+        }
+        // Both bots emit this on Vodafone SMS confirmation:
+        //   PAYMENT_CONFIRMED txn=020176427512 amount=93 merchant=Carry1st
+        const m3 = line.match(/PAYMENT_CONFIRMED\s+txn=(\S+)\s+amount=([\d.]+)/);
+        if (m3) {
+          paymentTxnId = m3[1];
+          // Prefer SMS-confirmed amount over any earlier estimate.
+          amount = parseFloat(m3[2]);
         }
       }
     };
@@ -60,7 +107,14 @@ function runBot(job: Job): Promise<{ exitCode: number; logTail: string; amount: 
     child.stderr.on('data', capture);
     child.on('close', (exitCode) => {
       logStream.end(`# exit=${exitCode} finished=${new Date().toISOString()}\n`);
-      resolve({ exitCode: exitCode ?? -1, logTail: lines.slice(-60).join('\n'), amount, tradeToken, logFile });
+      resolve({
+        exitCode: exitCode ?? -1,
+        logTail: lines.slice(-60).join('\n'),
+        amount,
+        tradeToken,
+        paymentTxnId,
+        logFile,
+      });
     });
   });
 }
@@ -69,9 +123,11 @@ async function postCallback(job: Job): Promise<{ status: number | null; error: s
   const body = JSON.stringify({
     order_id: job.order_id,
     job_id: job.id,
+    bot_type: job.bot_type,
     status: job.status === 'success' ? 'success' : 'failed',
     amount_charged: job.amount_charged,
     trade_token: job.trade_token,
+    payment_txn_id: job.payment_txn_id,
     duration_ms: job.duration_ms,
     error: job.error,
   });
@@ -103,10 +159,11 @@ async function processOne(job: Job): Promise<void> {
     markFinished(job.id, 'success', {
       amount_charged: result.amount,
       trade_token: result.tradeToken,
+      payment_txn_id: result.paymentTxnId,
       duration_ms: duration,
       error: null,
     });
-    log('success', `job=${job.id} amount=${result.amount} duration=${duration}ms`);
+    log('success', `job=${job.id} amount=${result.amount} txn=${result.paymentTxnId ?? '(no SMS)'} duration=${duration}ms`);
   } else {
     // Prefer a clean "Paymob rejected payment: ..." line if present, else last error-ish line
     const allLines = result.logTail.split('\n');
@@ -117,6 +174,7 @@ async function processOne(job: Job): Promise<void> {
     markFinished(job.id, 'failed', {
       amount_charged: result.amount,
       trade_token: result.tradeToken,
+      payment_txn_id: result.paymentTxnId,
       duration_ms: duration,
       error: errLine.slice(0, 500),
     });

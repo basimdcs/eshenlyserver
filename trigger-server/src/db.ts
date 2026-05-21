@@ -32,13 +32,33 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_jobs_order_id ON jobs(order_id);
 `);
 
+// Idempotent migrations for multi-bot dispatch. Each ALTER throws if the
+// column already exists; catch and continue.
+const addColumn = (sql: string) => {
+  try { db.exec(sql); } catch (err) {
+    if (!/duplicate column name/i.test(String(err))) throw err;
+  }
+};
+addColumn(`ALTER TABLE jobs ADD COLUMN bot_type TEXT NOT NULL DEFAULT 'pubg'`);
+addColumn(`ALTER TABLE jobs ADD COLUMN url TEXT`);
+addColumn(`ALTER TABLE jobs ADD COLUMN bundle_label TEXT`);
+addColumn(`ALTER TABLE jobs ADD COLUMN fields_json TEXT`);
+addColumn(`ALTER TABLE jobs ADD COLUMN payment_txn_id TEXT`);
+
 export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'callback_failed';
+export type BotType = 'pubg' | 'carry1st';
 
 export interface Job {
   id: string;
   order_id: string;
+  bot_type: BotType;
+  // PUBG-specific (sentinel '' / 0 for carry1st jobs)
   player_id: string;
   sku: number;
+  // Carry1st-specific (null for PUBG jobs)
+  url: string | null;
+  bundle_label: string | null;
+  fields_json: string | null;
   callback_url: string;
   customer_email: string | null;
   status: JobStatus;
@@ -47,6 +67,7 @@ export interface Job {
   finished_at: number | null;
   amount_charged: number | null;
   trade_token: string | null;
+  payment_txn_id: string | null;
   error: string | null;
   duration_ms: number | null;
   callback_attempts: number;
@@ -54,7 +75,7 @@ export interface Job {
   callback_last_error: string | null;
 }
 
-export function insertJob(job: {
+export function insertPubgJob(job: {
   id: string;
   order_id: string;
   player_id: string;
@@ -63,10 +84,37 @@ export function insertJob(job: {
   customer_email: string | null;
 }): void {
   db.prepare(`
-    INSERT INTO jobs (id, order_id, player_id, sku, callback_url, customer_email, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
+    INSERT INTO jobs (id, order_id, bot_type, player_id, sku, callback_url, customer_email, status, created_at)
+    VALUES (?, ?, 'pubg', ?, ?, ?, ?, 'queued', ?)
   `).run(job.id, job.order_id, job.player_id, job.sku, job.callback_url, job.customer_email, Date.now());
 }
+
+export function insertCarry1stJob(job: {
+  id: string;
+  order_id: string;
+  url: string;
+  bundle_label: string;
+  fields: Record<string, string>;
+  callback_url: string;
+  customer_email: string | null;
+}): void {
+  db.prepare(`
+    INSERT INTO jobs (id, order_id, bot_type, player_id, sku, url, bundle_label, fields_json, callback_url, customer_email, status, created_at)
+    VALUES (?, ?, 'carry1st', '', 0, ?, ?, ?, ?, ?, 'queued', ?)
+  `).run(
+    job.id,
+    job.order_id,
+    job.url,
+    job.bundle_label,
+    JSON.stringify(job.fields),
+    job.callback_url,
+    job.customer_email,
+    Date.now(),
+  );
+}
+
+// Backwards-compat alias used by older code paths.
+export const insertJob = insertPubgJob;
 
 export function findByOrderId(order_id: string): Job | undefined {
   return db.prepare('SELECT * FROM jobs WHERE order_id = ?').get(order_id) as Job | undefined;
@@ -92,17 +140,24 @@ export function claimNextQueued(): Job | undefined {
 export function markFinished(
   id: string,
   status: Extract<JobStatus, 'success' | 'failed'>,
-  details: { amount_charged?: number | null; trade_token?: string | null; error?: string | null; duration_ms: number },
+  details: {
+    amount_charged?: number | null;
+    trade_token?: string | null;
+    payment_txn_id?: string | null;
+    error?: string | null;
+    duration_ms: number;
+  },
 ): void {
   db.prepare(`
     UPDATE jobs SET
-      status = ?, finished_at = ?, amount_charged = ?, trade_token = ?, error = ?, duration_ms = ?
+      status = ?, finished_at = ?, amount_charged = ?, trade_token = ?, payment_txn_id = ?, error = ?, duration_ms = ?
     WHERE id = ?
   `).run(
     status,
     Date.now(),
     details.amount_charged ?? null,
     details.trade_token ?? null,
+    details.payment_txn_id ?? null,
     details.error ?? null,
     details.duration_ms,
     id,
