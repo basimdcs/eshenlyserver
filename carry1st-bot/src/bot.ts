@@ -68,6 +68,32 @@ export class Carry1stBot {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     });
     this.page = await context.newPage();
+
+    // Block heavy/irrelevant resources to keep the renderer from OOMing on
+    // small-RAM VPSes. Default ON — opt out with BLOCK_MEDIA=false.
+    if (process.env.BLOCK_MEDIA !== "false") {
+      // Don't block stylesheets — Carry1st validation may depend on layout.
+      const blockedTypes = new Set(["image", "media", "font"]);
+      const blockedHostPatterns = [
+        /google-analytics\.com/,
+        /googletagmanager\.com/,
+        /doubleclick\.net/,
+        /facebook\.net/,
+        /hotjar\.com/,
+        /clarity\.ms/,
+        /segment\.io/,
+        /datadoghq/,
+      ];
+      await this.page.route("**/*", (route) => {
+        const req = route.request();
+        if (blockedTypes.has(req.resourceType())) return route.abort();
+        const url = req.url();
+        if (blockedHostPatterns.some((p) => p.test(url))) return route.abort();
+        return route.continue();
+      });
+      log("Resource blocking enabled", "images/media/fonts/css/analytics");
+    }
+
     if (this.config.proxy) log("Using proxy", this.config.proxy);
   }
 
