@@ -28,24 +28,39 @@ export class Carry1stBot {
       channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
       executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
       proxy: this.config.proxy ? { server: this.config.proxy } : undefined,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-background-timer-throttling",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--no-first-run",
-        "--mute-audio",
-        "--single-process",
-        "--no-zygote",
-        "--renderer-process-limit=1",
-        "--disable-features=site-per-process,IsolateOrigins,TranslateUI",
-        "--js-flags=--max-old-space-size=384",
-      ],
+      // Carry1st pages are heavy React apps — --single-process + 384MB V8 cap
+      // crashes the renderer mid-load. Opt-in via LOW_MEMORY_BROWSER=true if
+      // you're squeezed for RAM and willing to risk it.
+      args: process.env.LOW_MEMORY_BROWSER === "true"
+        ? [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--no-first-run",
+            "--mute-audio",
+            "--single-process",
+            "--no-zygote",
+            "--renderer-process-limit=1",
+            "--disable-features=site-per-process,IsolateOrigins,TranslateUI",
+            "--js-flags=--max-old-space-size=384",
+          ]
+        : [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--mute-audio",
+          ],
     });
     const context = await this.browser.newContext({
       viewport: { width: 1280, height: 800 },
