@@ -73,8 +73,12 @@ export class Carry1stBot {
 
   async navigateToProduct() {
     log("Navigating", this.config.url);
-    await this.page.goto(this.config.url, { waitUntil: "networkidle" });
-    await sleep(2000);
+    // "networkidle" never settles on Carry1st (continuous analytics/ads polling)
+    // and the chromium renderer OOMs waiting for it on small-RAM VPS. Use
+    // domcontentloaded + a fixed hydration wait instead.
+    await this.page.goto(this.config.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await this.page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
+    await sleep(3000);
   }
 
   async dismissPopups() {
