@@ -144,26 +144,32 @@ export class Carry1stBot {
       } catch {}
       return false;
     };
+    const overlaySelector =
+      '[role="dialog"]:visible, [data-state="open"][aria-hidden="true"], .dialog-container';
+    const overlayPresent = async () =>
+      this.page
+        .locator(overlaySelector)
+        .first()
+        .isVisible({ timeout: 200 })
+        .catch(() => false);
+
     try {
-      let attempts = 0;
       const deadline = Date.now() + 10000;
+      let dismissed = 0;
       while (Date.now() < deadline) {
-        const overlayPresent = await this.page
-          .locator('[role="dialog"], [data-state="open"], .dialog-container')
-          .first()
-          .isVisible({ timeout: 200 })
-          .catch(() => false);
-        if (!overlayPresent && attempts > 0) break;
-        const clicked = await dismissOnce();
-        if (clicked) {
+        if (!(await overlayPresent())) break;
+        await dismissOnce();
+        // Give it a moment to animate out
+        await sleep(400);
+        if (!(await overlayPresent())) {
+          dismissed++;
           log("Dismissed popup");
-          attempts++;
-        } else if (!overlayPresent) {
           break;
-        } else {
-          await sleep(500);
         }
+        // Still there — try once more, then bail to avoid infinite loop
+        dismissed++;
       }
+      if (dismissed > 0) log(`Popup loop done (${dismissed} attempts)`);
     } catch {
       log("No popup found, continuing");
     }
