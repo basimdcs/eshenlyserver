@@ -109,15 +109,50 @@ export class Carry1stBot {
 
   async dismissPopups() {
     log("Dismissing popups");
+    // Try to dismiss any open dialogs over ~10s. Carry1st uses Radix Dialog
+    // which renders an invisible overlay (z-60) that blocks all clicks until
+    // closed — a short timeout silently misses it on slow loads, leaving the
+    // bot unable to click bundles/payment buttons later.
+    const dismissSelectors = [
+      'button:has-text("Continue to Egypt")',
+      'button:has-text("Continue")',
+      '[aria-label="Close"]',
+      'button:has-text("×")',
+      'dialog button',
+      '[role="dialog"] button',
+    ];
+    const dismissOnce = async (): Promise<boolean> => {
+      for (const sel of dismissSelectors) {
+        try {
+          const btn = this.page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 200 }).catch(() => false)) {
+            await btn.click({ timeout: 2000 });
+            await sleep(700);
+            return true;
+          }
+        } catch {}
+      }
+      return false;
+    };
     try {
-      const closeBtn = this.page.locator(
-        'button:has-text("Continue"), [aria-label="Close"], button:has-text("×"), dialog button'
-      );
-      const visible = await closeBtn.first().isVisible({ timeout: 3000 });
-      if (visible) {
-        await closeBtn.first().click();
-        log("Dismissed popup");
-        await sleep(1000);
+      let attempts = 0;
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        const overlayPresent = await this.page
+          .locator('[role="dialog"], [data-state="open"], .dialog-container')
+          .first()
+          .isVisible({ timeout: 200 })
+          .catch(() => false);
+        if (!overlayPresent && attempts > 0) break;
+        const clicked = await dismissOnce();
+        if (clicked) {
+          log("Dismissed popup");
+          attempts++;
+        } else if (!overlayPresent) {
+          break;
+        } else {
+          await sleep(500);
+        }
       }
     } catch {
       log("No popup found, continuing");
