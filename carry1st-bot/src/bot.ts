@@ -175,20 +175,31 @@ export class Carry1stBot {
 
   async selectPaymentMethod() {
     log("Selecting payment", this.config.paymentMethod);
+    // The "Select Payment Method" section renders 5-15s after bundle selection
+    // on some products (Blood Strike). Wait for the section header first, then
+    // click the specific method — much more reliable than racing on the button.
+    try {
+      await this.page
+        .locator("text=/Select Payment Method/i")
+        .first()
+        .waitFor({ state: "visible", timeout: 20000 });
+    } catch {
+      // Header not found within 20s. Either the section never renders on this
+      // product, or the page is in a different language. Try the button
+      // directly as a fallback with a short timeout.
+    }
     const payBtn = this.page
       .locator("button, div[role='button'], label")
       .filter({ hasText: this.config.paymentMethod });
     try {
-      await payBtn.first().waitFor({ state: "visible", timeout: 4000 });
+      await payBtn.first().waitFor({ state: "visible", timeout: 8000 });
     } catch {
-      // Some Carry1st product pages (e.g. Blood Strike) don't have a payment
-      // selector on the product page — payment is chosen on pay.carry1st.com.
-      // Treat as optional: log and continue. Pay1st defaults the method
-      // sensibly based on the country; the bot's Vodafone wallet automation
-      // doesn't depend on this click.
+      // Genuinely no payment selector on this product (or our method isn't
+      // listed). Log and continue — Pay1st may still handle it. If BUY NOW
+      // stays disabled, the diagnostic dump below will reveal why.
       log(
-        "Payment selector not on product page",
-        "skipping (Pay1st will handle selection)"
+        "Payment selector not found on product page",
+        `("${this.config.paymentMethod}" not visible within 28s)`
       );
       return;
     }
