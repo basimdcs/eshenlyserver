@@ -113,13 +113,17 @@ export class Carry1stBot {
     // which renders an invisible overlay (z-60) that blocks all clicks until
     // closed — a short timeout silently misses it on slow loads, leaving the
     // bot unable to click bundles/payment buttons later.
+    // Priority: language-neutral dismissals first. "Continue to Egypt" /
+    // "Continue" confirm a country and silently switch the page to Arabic on
+    // EG, which then breaks every English label-based selector downstream.
+    // Only fall back to them if nothing else works.
     const dismissSelectors = [
-      'button:has-text("Continue to Egypt")',
-      'button:has-text("Continue")',
+      'button:has-text("Ignore")',
+      'button:has-text("تجاهل")',           // Arabic for "Ignore"
       '[aria-label="Close"]',
+      '[aria-label="close"]',
       'button:has-text("×")',
-      'dialog button',
-      '[role="dialog"] button',
+      'button:has-text("✕")',
     ];
     const dismissOnce = async (): Promise<boolean> => {
       for (const sel of dismissSelectors) {
@@ -132,6 +136,12 @@ export class Carry1stBot {
           }
         } catch {}
       }
+      // Last resort: press Escape (works for Radix Dialog and most modal libs)
+      try {
+        await this.page.keyboard.press("Escape");
+        await sleep(700);
+        return true;
+      } catch {}
       return false;
     };
     try {
