@@ -67,6 +67,40 @@ export class Carry1stBot {
       userAgent:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     });
+
+    // Browser-side guard: dismiss any country popup the instant it renders.
+    // Runs in the page context via MutationObserver — no Playwright round-trip.
+    // Without this, the Radix dialog overlay can appear mid-click and block it.
+    // We pick language-neutral dismiss targets (never "Continue to Egypt",
+    // which silently switches the site to Arabic).
+    await context.addInitScript(() => {
+      const dismissDialog = () => {
+        const dlg = document.querySelector('[role="dialog"], .dialog-container');
+        if (!dlg) return;
+        const buttons = Array.from(dlg.querySelectorAll("button"));
+        const targets = [
+          (b: HTMLButtonElement) => (b.textContent || "").trim() === "Ignore",
+          (b: HTMLButtonElement) => (b.textContent || "").trim() === "تجاهل",
+          (b: HTMLButtonElement) => b.getAttribute("aria-label") === "Close",
+          (b: HTMLButtonElement) => b.getAttribute("aria-label") === "close",
+          (b: HTMLButtonElement) => ["×", "✕"].includes((b.textContent || "").trim()),
+        ];
+        for (const pick of targets) {
+          const btn = buttons.find(pick as (b: Element) => boolean) as HTMLButtonElement | undefined;
+          if (btn) {
+            btn.click();
+            return;
+          }
+        }
+      };
+      const obs = new MutationObserver(() => dismissDialog());
+      const start = () => obs.observe(document.body, { childList: true, subtree: true });
+      if (document.body) start();
+      else document.addEventListener("DOMContentLoaded", start);
+      // Also dismiss any dialog already present at script-eval time.
+      dismissDialog();
+    });
+
     this.page = await context.newPage();
 
     // Block heavy/irrelevant resources to keep the renderer from OOMing on
