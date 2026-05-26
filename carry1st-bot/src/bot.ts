@@ -914,9 +914,17 @@ export class Carry1stBot {
       await this.navigateToProduct();
       await this.dismissPopups();
       await this.fillProductFields();
+      // Carry1st validates the game account ID server-side after the input is
+      // filled. Until validation completes, downstream sections (bundles +
+      // payment cards) may not render. Wait ~5s for the green checkmark /
+      // account nickname to appear.
+      await sleep(5000);
       await this.selectBundle();
-      await this.selectPaymentMethod();
       await this.fillContactDetails();
+      // Payment cards on some products (Blood Strike, possibly others) only
+      // render AFTER contact details are filled — so select payment last,
+      // right before BUY NOW.
+      await this.selectPaymentMethod();
       if (this.config.stopBeforeBuy) {
         log("STOP-BEFORE-BUY", "All fields filled. BUY NOW not clicked. No payment triggered.");
         try {
