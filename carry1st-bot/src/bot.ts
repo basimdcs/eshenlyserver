@@ -360,10 +360,12 @@ export class Carry1stBot {
     // Wait for the "Select Payment Method" header to render — section is
     // lazy-loaded after bundle selection on some products.
     try {
-      await this.page
-        .locator("text=/Select Payment Method/i")
-        .first()
-        .waitFor({ state: "visible", timeout: 20000 });
+      const header = this.page.locator("text=/Select Payment Method/i").first();
+      await header.waitFor({ state: "visible", timeout: 20000 });
+      // Scroll the header into view so the payment cards below it render
+      // (some products lazily mount the cards based on viewport visibility).
+      await header.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await sleep(1500);
     } catch {
       // Header not found — page might be Arabic ("اختر طريقة الدفع") or
       // payment selection might not exist on this product.
