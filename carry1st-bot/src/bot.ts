@@ -107,43 +107,10 @@ export class Carry1stBot {
     await sleep(3000);
   }
 
-  async dismissPopups() {
-    log("Dismissing popups");
-    // Try to dismiss any open dialogs over ~10s. Carry1st uses Radix Dialog
-    // which renders an invisible overlay (z-60) that blocks all clicks until
-    // closed — a short timeout silently misses it on slow loads, leaving the
-    // bot unable to click bundles/payment buttons later.
-    // Priority: language-neutral dismissals first. "Continue to Egypt" /
-    // "Continue" confirm a country and silently switch the page to Arabic on
-    // EG, which then breaks every English label-based selector downstream.
-    // Only fall back to them if nothing else works.
-    const dismissSelectors = [
-      'button:has-text("Ignore")',
-      'button:has-text("تجاهل")',           // Arabic for "Ignore"
-      '[aria-label="Close"]',
-      '[aria-label="close"]',
-      'button:has-text("×")',
-      'button:has-text("✕")',
-    ];
-    const dismissOnce = async (): Promise<boolean> => {
-      for (const sel of dismissSelectors) {
-        try {
-          const btn = this.page.locator(sel).first();
-          if (await btn.isVisible({ timeout: 200 }).catch(() => false)) {
-            await btn.click({ timeout: 2000 });
-            await sleep(700);
-            return true;
-          }
-        } catch {}
-      }
-      // Last resort: press Escape (works for Radix Dialog and most modal libs)
-      try {
-        await this.page.keyboard.press("Escape");
-        await sleep(700);
-        return true;
-      } catch {}
-      return false;
-    };
+  // Carry1st's country-picker popup is intermittent and renders at variable
+  // delay (1-20s after navigation). Once present, its overlay (Radix Dialog
+  // z-60) blocks all clicks. Call this before every critical interaction.
+  private async ensureNoOverlay(reason: string = "") {
     const overlaySelector =
       '[role="dialog"]:visible, [data-state="open"][aria-hidden="true"], .dialog-container';
     const overlayPresent = async () =>
@@ -153,26 +120,66 @@ export class Carry1stBot {
         .isVisible({ timeout: 200 })
         .catch(() => false);
 
-    try {
-      const deadline = Date.now() + 10000;
-      let dismissed = 0;
-      while (Date.now() < deadline) {
-        if (!(await overlayPresent())) break;
-        await dismissOnce();
-        // Give it a moment to animate out
-        await sleep(400);
-        if (!(await overlayPresent())) {
-          dismissed++;
-          log("Dismissed popup");
-          break;
-        }
-        // Still there — try once more, then bail to avoid infinite loop
-        dismissed++;
+    if (!(await overlayPresent())) return;
+
+    // Language-neutral dismissals first. "Continue to Egypt" silently switches
+    // the site to Arabic, breaking every English-label selector downstream.
+    const dismissSelectors = [
+      'button:has-text("Ignore")',
+      'button:has-text("تجاهل")',
+      '[aria-label="Close"]',
+      '[aria-label="close"]',
+      'button:has-text("×")',
+      'button:has-text("✕")',
+    ];
+
+    const tag = reason ? ` (${reason})` : "";
+    log(`Overlay detected${tag} — dismissing`);
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      for (const sel of dismissSelectors) {
+        try {
+          const btn = this.page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 200 }).catch(() => false)) {
+            await btn.click({ timeout: 2000 });
+            await sleep(500);
+            if (!(await overlayPresent())) {
+              log("Overlay dismissed");
+              return;
+            }
+          }
+        } catch {}
       }
-      if (dismissed > 0) log(`Popup loop done (${dismissed} attempts)`);
-    } catch {
-      log("No popup found, continuing");
+      // Fallback: Escape key
+      await this.page.keyboard.press("Escape").catch(() => {});
+      await sleep(500);
+      if (!(await overlayPresent())) {
+        log("Overlay dismissed (via Escape)");
+        return;
+      }
     }
+    log("Overlay still present after 4 attempts — proceeding anyway");
+  }
+
+  async dismissPopups() {
+    log("Dismissing popups");
+    // Initial sweep — wait up to 5s for the overlay to render, then dismiss.
+    // Most products render it within 2-3s. Some (e.g. Blood Strike) render
+    // later, but ensureNoOverlay() before each click handles that case.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const overlay = await this.page
+        .locator('[role="dialog"]:visible, .dialog-container')
+        .first()
+        .isVisible({ timeout: 300 })
+        .catch(() => false);
+      if (overlay) {
+        await this.ensureNoOverlay("initial");
+        return;
+      }
+      await sleep(500);
+    }
+    log("No popup yet (will recheck before each click)");
   }
 
   async fillProductFields() {
@@ -189,6 +196,7 @@ export class Carry1stBot {
   }
 
   async selectBundle() {
+    await this.ensureNoOverlay("before bundle");
     log("Selecting bundle", this.config.bundleLabel);
     const bundleBtn = this.page
       .locator("button, div[role='button'], label")
@@ -225,6 +233,7 @@ export class Carry1stBot {
   }
 
   async selectPaymentMethod() {
+    await this.ensureNoOverlay("before payment");
     log("Selecting payment", this.config.paymentMethod);
     // The "Select Payment Method" section renders 5-15s after bundle selection
     // on some products (Blood Strike). Wait for the section header first, then
@@ -304,6 +313,7 @@ export class Carry1stBot {
   }
 
   async clickBuyNow() {
+    await this.ensureNoOverlay("before BUY NOW");
     log("Clicking BUY NOW");
     this.purchaseStartedAt = Date.now();
     const buyBtn = this.page.locator('button:has-text("BUY NOW")');
