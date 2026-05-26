@@ -159,18 +159,21 @@ export class Carry1stBot {
 
   // Nuke any country-popup overlay still present in the DOM. Faster and more
   // reliable than clicking a dismiss button — works even if the dismiss
-  // button is in a weird state. Called from ensureNoOverlay as a last resort
-  // and from clickByJs before critical clicks.
+  // button is in a weird state. Clears Radix's body/html scroll locks too.
   private async forceRemoveOverlay() {
     await this.page
       .evaluate(() => {
         document
           .querySelectorAll('[role="dialog"], .dialog-container')
           .forEach((el) => el.remove());
-        // Also clear any body-level scroll lock that Radix sets.
-        document.body.style.removeProperty("pointer-events");
-        document.body.style.removeProperty("overflow");
-        document.documentElement.style.removeProperty("overflow");
+        // Radix Dialog adds pointer-events/overflow styles + data-* attrs to
+        // body and html to lock scroll. Clear all of them.
+        for (const el of [document.body, document.documentElement]) {
+          el.style.removeProperty("pointer-events");
+          el.style.removeProperty("overflow");
+          el.style.removeProperty("padding-right");
+          el.removeAttribute("data-scroll-locked");
+        }
       })
       .catch(() => {});
   }
