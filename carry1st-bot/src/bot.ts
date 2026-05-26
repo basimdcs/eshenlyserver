@@ -157,6 +157,58 @@ export class Carry1stBot {
     await sleep(3000);
   }
 
+  // Nuke any country-popup overlay still present in the DOM. Faster and more
+  // reliable than clicking a dismiss button — works even if the dismiss
+  // button is in a weird state. Called from ensureNoOverlay as a last resort
+  // and from clickByJs before critical clicks.
+  private async forceRemoveOverlay() {
+    await this.page
+      .evaluate(() => {
+        document
+          .querySelectorAll('[role="dialog"], .dialog-container')
+          .forEach((el) => el.remove());
+        // Also clear any body-level scroll lock that Radix sets.
+        document.body.style.removeProperty("pointer-events");
+        document.body.style.removeProperty("overflow");
+        document.documentElement.style.removeProperty("overflow");
+      })
+      .catch(() => {});
+  }
+
+  // Click an element by text via JS evaluate — bypasses Playwright's
+  // actionability poll and any pointer-event-blocking overlay.
+  private async clickByText(text: string): Promise<boolean> {
+    return await this.page.evaluate((t: string) => {
+      const all = Array.from(document.querySelectorAll("button, div, label, a, span"));
+      const target = all.find((el) => (el.textContent || "").trim() === t);
+      if (!target) return false;
+      // Walk up to find a clickable ancestor (Carry1st cards have nested spans).
+      let click: Element | null = target;
+      for (let i = 0; i < 5 && click; i++) {
+        if (click instanceof HTMLElement) {
+          click.click();
+          return true;
+        }
+        click = click.parentElement;
+      }
+      return false;
+    }, text);
+  }
+
+  // Click an element where ANY descendant has this text (substring match).
+  private async clickByPartialText(text: string): Promise<boolean> {
+    return await this.page.evaluate((t: string) => {
+      const all = Array.from(document.querySelectorAll("button, div, label, a"));
+      const target = all.find((el) => {
+        const txt = (el.textContent || "").trim();
+        return txt.includes(t) && txt.length < 200;
+      });
+      if (!target) return false;
+      (target as HTMLElement).click();
+      return true;
+    }, text);
+  }
+
   // Carry1st's country-picker popup is intermittent and renders at variable
   // delay (1-20s after navigation). Once present, its overlay (Radix Dialog
   // z-60) blocks all clicks. Call this before every critical interaction.
@@ -252,6 +304,8 @@ export class Carry1stBot {
 
   async selectBundle() {
     await this.ensureNoOverlay("before bundle");
+    // Belt + suspenders: also force-remove any stale overlay nodes.
+    await this.forceRemoveOverlay();
     log("Selecting bundle", this.config.bundleLabel);
     const bundleBtn = this.page
       .locator("button, div[role='button'], label")
@@ -283,7 +337,16 @@ export class Carry1stBot {
       log("Candidate button texts", JSON.stringify(candidates, null, 2));
       throw err;
     }
-    await bundleBtn.first().click();
+    // Try normal click first; if blocked by an overlay that snuck in, fall
+    // back to a JS click that bypasses pointer-event interception.
+    try {
+      await bundleBtn.first().click({ timeout: 5000 });
+    } catch (err) {
+      log("Normal bundle click failed — trying JS click + overlay force-remove");
+      await this.forceRemoveOverlay();
+      const ok = await this.clickByPartialText(this.config.bundleLabel);
+      if (!ok) throw err;
+    }
     await sleep(1500);
   }
 
@@ -329,13 +392,13 @@ export class Carry1stBot {
       return;
     }
 
-    // Click. If the element is plain text, Playwright will click the
-    // containing element. Use force: true as a last-resort fallback if a
-    // normal click is intercepted.
     try {
       await target.click({ timeout: 3000 });
     } catch {
-      await target.click({ force: true, timeout: 3000 });
+      log("Normal payment click failed — JS click fallback");
+      await this.forceRemoveOverlay();
+      const ok = await this.clickByText(this.config.paymentMethod);
+      if (!ok) await target.click({ force: true, timeout: 3000 });
     }
     await sleep(1500);
   }
