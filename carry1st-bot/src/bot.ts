@@ -98,6 +98,23 @@ export class Carry1stBot {
   }
 
   async navigateToProduct() {
+    // Visit the country/locale landing page FIRST so Carry1st commits to
+    // EG + EN before the product page renders. Skipping this step causes
+    // some product pages (Blood Strike confirmed) to never render the
+    // "Select Payment Method" section, leaving BUY NOW perma-disabled.
+    // Derived from the product URL — same origin, same /en/<COUNTRY>/ prefix.
+    const localeMatch = this.config.url.match(/^(https:\/\/shop\.carry1st\.com\/[^/]+\/[^/]+)/);
+    if (localeMatch) {
+      const landingUrl = localeMatch[1];
+      log("Establishing locale", landingUrl);
+      try {
+        await this.page.goto(landingUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+        await sleep(2000);
+      } catch (err) {
+        log("Locale-establishing nav failed (continuing)", String(err).slice(0, 100));
+      }
+    }
+
     log("Navigating", this.config.url);
     // "networkidle" never settles on Carry1st (continuous analytics/ads polling)
     // and the chromium renderer OOMs waiting for it on small-RAM VPS. Use
