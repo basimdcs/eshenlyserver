@@ -178,7 +178,20 @@ export class Carry1stBot {
     const payBtn = this.page
       .locator("button, div[role='button'], label")
       .filter({ hasText: this.config.paymentMethod });
-    await payBtn.first().waitFor({ state: "visible", timeout: 10000 });
+    try {
+      await payBtn.first().waitFor({ state: "visible", timeout: 4000 });
+    } catch {
+      // Some Carry1st product pages (e.g. Blood Strike) don't have a payment
+      // selector on the product page — payment is chosen on pay.carry1st.com.
+      // Treat as optional: log and continue. Pay1st defaults the method
+      // sensibly based on the country; the bot's Vodafone wallet automation
+      // doesn't depend on this click.
+      log(
+        "Payment selector not on product page",
+        "skipping (Pay1st will handle selection)"
+      );
+      return;
+    }
     await payBtn.first().click();
     await sleep(1500);
   }
