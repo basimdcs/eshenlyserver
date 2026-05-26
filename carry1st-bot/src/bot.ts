@@ -68,37 +68,36 @@ export class Carry1stBot {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     });
 
-    // Browser-side guard: dismiss any country popup the instant it renders.
-    // Runs in the page context via MutationObserver — no Playwright round-trip.
-    // Without this, the Radix dialog overlay can appear mid-click and block it.
-    // We pick language-neutral dismiss targets (never "Continue to Egypt",
-    // which silently switches the site to Arabic).
+    // Browser-side guard: auto-dismiss Carry1st's country popup the instant
+    // it renders. Without this, the Radix dialog overlay can appear mid-click
+    // and block it ("subtree intercepts pointer events"). Inlined into a
+    // single arrow so tsx doesn't wrap helpers with __name (which is undefined
+    // in the browser context and would throw on eval).
     await context.addInitScript(() => {
-      const dismissDialog = () => {
+      const obs = new MutationObserver(() => {
         const dlg = document.querySelector('[role="dialog"], .dialog-container');
         if (!dlg) return;
-        const buttons = Array.from(dlg.querySelectorAll("button"));
-        const targets = [
-          (b: HTMLButtonElement) => (b.textContent || "").trim() === "Ignore",
-          (b: HTMLButtonElement) => (b.textContent || "").trim() === "تجاهل",
-          (b: HTMLButtonElement) => b.getAttribute("aria-label") === "Close",
-          (b: HTMLButtonElement) => b.getAttribute("aria-label") === "close",
-          (b: HTMLButtonElement) => ["×", "✕"].includes((b.textContent || "").trim()),
-        ];
-        for (const pick of targets) {
-          const btn = buttons.find(pick as (b: Element) => boolean) as HTMLButtonElement | undefined;
-          if (btn) {
-            btn.click();
+        // Search buttons across the whole document — the dismiss button
+        // may be a sibling of the overlay, not a child of dialog-container.
+        const all = Array.from(document.querySelectorAll("button"));
+        for (const btn of all) {
+          const txt = (btn.textContent || "").trim();
+          if (txt === "Ignore" || txt === "تجاهل" || txt === "×" || txt === "✕") {
+            (btn as HTMLElement).click();
+            return;
+          }
+          const aria = btn.getAttribute("aria-label") || "";
+          if (aria === "Close" || aria === "close") {
+            (btn as HTMLElement).click();
             return;
           }
         }
+      });
+      const start = () => {
+        try { obs.observe(document.body, { childList: true, subtree: true }); } catch {}
       };
-      const obs = new MutationObserver(() => dismissDialog());
-      const start = () => obs.observe(document.body, { childList: true, subtree: true });
       if (document.body) start();
       else document.addEventListener("DOMContentLoaded", start);
-      // Also dismiss any dialog already present at script-eval time.
-      dismissDialog();
     });
 
     this.page = await context.newPage();
@@ -214,10 +213,12 @@ export class Carry1stBot {
 
   async dismissPopups() {
     log("Dismissing popups");
-    // Initial sweep — wait up to 5s for the overlay to render, then dismiss.
-    // Most products render it within 2-3s. Some (e.g. Blood Strike) render
-    // later, but ensureNoOverlay() before each click handles that case.
-    const deadline = Date.now() + 5000;
+    // Wait up to 8s for the country popup to render, then dismiss. Carry1st's
+    // dialog typically appears ~1s after page load, but the MutationObserver
+    // from launch() handles whatever appears. This is a belt-and-suspenders
+    // fallback in case the observer's first sweep happens before the dialog
+    // mounts (race condition).
+    const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
       const overlay = await this.page
         .locator('[role="dialog"]:visible, .dialog-container')
@@ -226,11 +227,14 @@ export class Carry1stBot {
         .catch(() => false);
       if (overlay) {
         await this.ensureNoOverlay("initial");
+        // Wait a moment for the dialog teardown animation to finish so the
+        // overlay actually unmounts before the next click.
+        await sleep(1000);
         return;
       }
       await sleep(500);
     }
-    log("No popup yet (will recheck before each click)");
+    log("No popup appeared within 8s");
   }
 
   async fillProductFields() {
