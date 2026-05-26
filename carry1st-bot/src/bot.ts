@@ -290,35 +290,53 @@ export class Carry1stBot {
   async selectPaymentMethod() {
     await this.ensureNoOverlay("before payment");
     log("Selecting payment", this.config.paymentMethod);
-    // The "Select Payment Method" section renders 5-15s after bundle selection
-    // on some products (Blood Strike). Wait for the section header first, then
-    // click the specific method — much more reliable than racing on the button.
+
+    // Wait for the "Select Payment Method" header to render — section is
+    // lazy-loaded after bundle selection on some products.
     try {
       await this.page
         .locator("text=/Select Payment Method/i")
         .first()
         .waitFor({ state: "visible", timeout: 20000 });
     } catch {
-      // Header not found within 20s. Either the section never renders on this
-      // product, or the page is in a different language. Try the button
-      // directly as a fallback with a short timeout.
+      // Header not found — page might be Arabic ("اختر طريقة الدفع") or
+      // payment selection might not exist on this product.
     }
-    const payBtn = this.page
-      .locator("button, div[role='button'], label")
-      .filter({ hasText: this.config.paymentMethod });
-    try {
-      await payBtn.first().waitFor({ state: "visible", timeout: 8000 });
-    } catch {
-      // Genuinely no payment selector on this product (or our method isn't
-      // listed). Log and continue — Pay1st may still handle it. If BUY NOW
-      // stays disabled, the diagnostic dump below will reveal why.
+
+    // Carry1st renders payment options as bare <div> cards (not buttons),
+    // so the original button-only selector missed them. Try multiple
+    // strategies in order of specificity.
+    const strategies = [
+      () => this.page.getByRole("button", { name: this.config.paymentMethod, exact: true }),
+      () => this.page.getByText(this.config.paymentMethod, { exact: true }),
+      () => this.page.locator(`button, [role="button"], div, label, a`).filter({ hasText: this.config.paymentMethod }),
+    ];
+
+    let target = null;
+    for (const strat of strategies) {
+      const loc = strat().first();
+      if (await loc.isVisible({ timeout: 4000 }).catch(() => false)) {
+        target = loc;
+        break;
+      }
+    }
+
+    if (!target) {
       log(
         "Payment selector not found on product page",
-        `("${this.config.paymentMethod}" not visible within 28s)`
+        `("${this.config.paymentMethod}" not visible) — skipping; Pay1st may handle it`
       );
       return;
     }
-    await payBtn.first().click();
+
+    // Click. If the element is plain text, Playwright will click the
+    // containing element. Use force: true as a last-resort fallback if a
+    // normal click is intercepted.
+    try {
+      await target.click({ timeout: 3000 });
+    } catch {
+      await target.click({ force: true, timeout: 3000 });
+    }
     await sleep(1500);
   }
 
