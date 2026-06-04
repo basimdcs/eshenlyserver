@@ -311,9 +311,13 @@ async function phase3_selectSkuAndCheckout(page: Page, config: PurchaseConfig): 
   log('phase-3', clicked);
   await page.waitForTimeout(2000);
 
-  // Verify checkout panel opened
+  // Verify checkout panel opened. Midasbuy renamed their CSS modules
+  // (ChannelListNew/PayPriceDetailPc → MidasbuyUI-channel_box/payment_box/
+  // check_box), so accept either generation of class names.
   const panelOpen = await page.evaluate(() => {
-    return !!document.querySelector('[class*="ChannelListNew"], [class*="PayPriceDetailPc"]');
+    return !!document.querySelector(
+      '[class*="ChannelListNew"], [class*="PayPriceDetailPc"], [class*="channel_box"], [class*="payment_box"]'
+    );
   });
 
   if (!panelOpen) {
@@ -335,7 +339,11 @@ async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): P
   let clicked = false;
   for (let attempt = 0; attempt < 5 && !clicked; attempt++) {
     clicked = await page.evaluate((searchLabels: string[]) => {
-      const items = document.querySelectorAll('[class*="ChannelPayList_payment_item"]');
+      // Old generation: ChannelPayList_payment_item. New generation:
+      // MidasbuyUI-check_box (channel rows in the redesigned panel).
+      const items = document.querySelectorAll(
+        '[class*="ChannelPayList_payment_item"], [class*="check_box"]'
+      );
       for (const searchLabel of searchLabels) {
         for (const item of items) {
           if (item.textContent?.includes(searchLabel)) {
@@ -355,7 +363,9 @@ async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): P
   if (!clicked) {
     // List available payment methods for debugging
     const available = await page.evaluate(() => {
-      const items = document.querySelectorAll('[class*="ChannelPayList_payment_item"]');
+      const items = document.querySelectorAll(
+        '[class*="ChannelPayList_payment_item"], [class*="check_box"]'
+      );
       return Array.from(items).map((item) => item.textContent?.trim().substring(0, 60) || '');
     });
     throw new Error(
@@ -365,14 +375,20 @@ async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): P
 
   await page.waitForTimeout(1500);
 
-  // Verify pay button is enabled
-  const btnState = await page.evaluate(() => {
-    const btn = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
-    if (!btn) return null;
-    return { text: btn.textContent, disabled: btn.disabled };
-  });
+  // Verify pay button is present and enabled
+  const btnState = await page.evaluate(findPayButtonInPage);
 
   if (!btnState) {
+    // Dump button candidates so the next failure tells us what to target.
+    const candidates = await page.evaluate(() => {
+      const out: string[] = [];
+      document.querySelectorAll('button, [class*="btn"]').forEach((el) => {
+        const t = (el.textContent || '').trim();
+        if (t.length > 1 && t.length < 60) out.push(`${el.tagName}[${(el.className || '').toString().slice(0, 50)}]: ${t.slice(0, 40)}`);
+      });
+      return [...new Set(out)].slice(0, 15);
+    });
+    log('phase-4', `DEBUG button candidates: ${JSON.stringify(candidates)}`);
     throw new Error('Pay button not found after selecting payment method');
   }
 
@@ -382,6 +398,31 @@ async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): P
 
   log('phase-4', `Pay button ready: "${btnState.text}" (enabled)`);
   await takeScreenshot(page, 'phase4-done');
+}
+
+// Locate the Pay button across both Midasbuy UI generations. Runs inside
+// page.evaluate. Returns metadata only (the click happens separately so
+// phase 4 can verify without clicking).
+function findPayButtonInPage(): { text: string; disabled: boolean } | null {
+  // Legacy layout
+  const legacy = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
+  if (legacy) return { text: legacy.textContent || '', disabled: legacy.disabled };
+  // New layout: text-based — a button/btn-div whose text is pay-like.
+  // Exclude section headers ("طرق الدفع" = payment methods) and login-only
+  // buttons that contain no pay verb.
+  const els = document.querySelectorAll('button, [class*="btn"]');
+  for (const el of Array.from(els)) {
+    const t = (el.textContent || '').trim();
+    if (t.length < 2 || t.length > 60) continue;
+    if (/طرق الدفع/.test(t)) continue;
+    if (/ادفع|الدفع الآن|اشتر الآن|اشترِ|pay now|buy now|proceed to pay/i.test(t)) {
+      const disabled =
+        (el as HTMLButtonElement).disabled === true ||
+        /disable/i.test((el.className || '').toString());
+      return { text: t, disabled };
+    }
+  }
+  return null;
 }
 
 // ── Phase 5: Click Pay button + capture payment tab ──────────────────────────
@@ -394,10 +435,27 @@ async function phase5_initiatePurchase(page: Page, config: PurchaseConfig): Prom
   const context = page.context();
   const popupPromise = context.waitForEvent('page', { timeout: 30000 }).catch(() => null);
 
-  await page.evaluate(() => {
-    const btn = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
-    btn?.click();
+  const payClicked = await page.evaluate(() => {
+    // Legacy layout first
+    const legacy = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
+    if (legacy) {
+      legacy.click();
+      return `legacy: ${(legacy.textContent || '').trim().slice(0, 40)}`;
+    }
+    // New layout: pay-verb text match (same rules as findPayButtonInPage)
+    const els = document.querySelectorAll('button, [class*="btn"]');
+    for (const el of Array.from(els)) {
+      const t = (el.textContent || '').trim();
+      if (t.length < 2 || t.length > 60) continue;
+      if (/طرق الدفع/.test(t)) continue;
+      if (/ادفع|الدفع الآن|اشتر الآن|اشترِ|pay now|buy now|proceed to pay/i.test(t)) {
+        (el as HTMLElement).click();
+        return `text-match: ${t.slice(0, 40)}`;
+      }
+    }
+    return null;
   });
+  log('phase-5', `Pay click result: ${payClicked || 'NOT FOUND'}`);
 
   await page.waitForTimeout(2000);
   await takeScreenshot(page, 'phase5-done');
