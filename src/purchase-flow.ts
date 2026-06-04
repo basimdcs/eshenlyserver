@@ -5,11 +5,17 @@ import { log, logError, takeScreenshot, wait } from './utils';
 
 const MIDASBUY_URL = 'https://www.midasbuy.com/midasbuy/eg/buy/pubgm';
 
-const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
-  ewallet: 'Vodafone Cash/Orange Cash/Etisalat Cash',
-  credit: 'Credit/ Debit/ Prepaid Card',
-  fawry: 'Fawry',
-  carrier: 'Orange / Vodafone / Etisalat / WE',
+// Candidate labels per method, tried in order. Midasbuy serves the EG page in
+// Arabic intermittently — channel names may render translated, so each method
+// lists English first, then unambiguous substrings, then Arabic fallbacks.
+// NOTE: bare "Vodafone" is NOT safe for ewallet — the carrier-billing channel
+// ("Orange / Vodafone / Etisalat / WE") also contains it. "Vodafone Cash" is
+// unique to the wallet channel.
+const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string[]> = {
+  ewallet: ['Vodafone Cash/Orange Cash/Etisalat Cash', 'Vodafone Cash', 'فودافون كاش'],
+  credit: ['Credit/ Debit/ Prepaid Card', 'Prepaid Card', 'بطاقة'],
+  fawry: ['Fawry', 'فوري'],
+  carrier: ['Orange / Vodafone / Etisalat / WE'],
 };
 
 /** Remove all promo/banner overlays that block pointer events */
@@ -184,9 +190,11 @@ async function phase2_enterPlayerId(page: Page, config: PurchaseConfig): Promise
   }, config.playerId);
   await wait(page);
 
-  // Click OK to submit
+  // Click OK to submit (Arabic page may label it موافق or تأكيد)
   log('phase-2', 'Submitting player ID...');
-  await jsClickButtonByText(page, 'OK');
+  for (const okText of ['OK', 'موافق', 'تأكيد']) {
+    if (await jsClickButtonByText(page, okText)) break;
+  }
 
   // Wait for player name validation from server
   log('phase-2', 'Waiting for player name validation...');
@@ -213,7 +221,9 @@ async function phase2_enterPlayerId(page: Page, config: PurchaseConfig): Promise
 
   // Dismiss congratulations dialog that appears after entering a valid player ID
   await page.waitForTimeout(1000);
-  await jsClickButtonByText(page, 'OK');
+  for (const okText of ['OK', 'موافق', 'تأكيد']) {
+    if (await jsClickButtonByText(page, okText)) break;
+  }
   await wait(page);
 
   await takeScreenshot(page, 'phase2-done');
@@ -226,10 +236,15 @@ async function phase3_selectSkuAndCheckout(page: Page, config: PurchaseConfig): 
 
   await clearOverlays(page);
 
-  // Wait for SKU cards to load
+  // Wait for SKU cards to load. Midasbuy renamed their CSS-module classes
+  // (RechargeClassCard_recharge_class_box no longer matches) — count the
+  // broader selector union so the loop breaks as soon as ANY card variant
+  // renders instead of burning all 10 retries.
   for (let i = 0; i < 10; i++) {
     const count = await page.evaluate(() =>
-      document.querySelectorAll('[class*="RechargeClassCard_recharge_class_box"]').length
+      document.querySelectorAll(
+        '[class*="RechargeClassCard_recharge_class_box"], [class*="recharge_class"], [class*="RechargeClass"]'
+      ).length
     );
     if (count > 0) break;
     log('phase-3', `Waiting for SKU cards to load (${i + 1}/10)...`);
@@ -274,7 +289,11 @@ async function phase3_selectSkuAndCheckout(page: Page, config: PurchaseConfig): 
       const cards = document.querySelectorAll(sel);
       for (const card of cards) {
         const text = card.textContent || '';
-        const cleaned = text.replace(/Popular/gi, '').replace(/热门/g, '').trim();
+        // Strip ANY leading non-digit prefix — handles "Popular" (en),
+        // "热门" (zh), "شهير" (ar), and whatever badge text Midasbuy adds
+        // next. The SKU number is always the first digit-run in the card
+        // (e.g. "شهير300+25..." → "300").
+        const cleaned = text.trim().replace(/^\D+/, '');
         const match = cleaned.match(/^(\d+)/);
         if (match && parseInt(match[1], 10) === targetSku) {
           (card as HTMLElement).click();
@@ -308,22 +327,25 @@ async function phase3_selectSkuAndCheckout(page: Page, config: PurchaseConfig): 
 // ── Phase 4: Select payment method in checkout panel ─────────────────────────
 
 async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): Promise<void> {
-  const label = PAYMENT_METHOD_LABELS[config.paymentMethod];
-  log('phase-4', `Selecting payment method: ${config.paymentMethod} (${label})`);
+  const labels = PAYMENT_METHOD_LABELS[config.paymentMethod];
+  log('phase-4', `Selecting payment method: ${config.paymentMethod} (candidates: ${labels.join(' | ')})`);
 
-  // Retry up to 5 times with 1s wait — payment channels may load slowly
+  // Retry up to 5 times with 1s wait — payment channels may load slowly.
+  // Each attempt tries every candidate label in priority order.
   let clicked = false;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    clicked = await page.evaluate((searchLabel: string) => {
+  for (let attempt = 0; attempt < 5 && !clicked; attempt++) {
+    clicked = await page.evaluate((searchLabels: string[]) => {
       const items = document.querySelectorAll('[class*="ChannelPayList_payment_item"]');
-      for (const item of items) {
-        if (item.textContent?.includes(searchLabel)) {
-          (item as HTMLElement).click();
-          return true;
+      for (const searchLabel of searchLabels) {
+        for (const item of items) {
+          if (item.textContent?.includes(searchLabel)) {
+            (item as HTMLElement).click();
+            return true;
+          }
         }
       }
       return false;
-    }, label);
+    }, labels);
 
     if (clicked) break;
     log('phase-4', `Payment channels not loaded yet, retrying (${attempt + 1}/5)...`);
