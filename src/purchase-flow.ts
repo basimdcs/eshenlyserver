@@ -379,16 +379,28 @@ async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): P
   const btnState = await page.evaluate(findPayButtonInPage);
 
   if (!btnState) {
-    // Dump button candidates so the next failure tells us what to target.
+    // Dump EVERY cursor:pointer element inside the checkout modal so we can
+    // see the exact pay-button class/text. The modal is the ancestor of the
+    // payment panel (channel_box/payment_box/ChannelListNew).
     const candidates = await page.evaluate(() => {
+      const panel = document.querySelector(
+        '[class*="channel_box"], [class*="payment_box"], [class*="ChannelListNew"], [class*="PayPriceDetailPc"]'
+      );
+      let modal: Element | null = panel;
+      for (let i = 0; i < 8 && modal?.parentElement; i++) modal = modal.parentElement;
+      const root = modal || document.body;
       const out: string[] = [];
-      document.querySelectorAll('button, [class*="btn"]').forEach((el) => {
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.children.length > 1) return;
         const t = (el.textContent || '').trim();
-        if (t.length > 1 && t.length < 60) out.push(`${el.tagName}[${(el.className || '').toString().slice(0, 50)}]: ${t.slice(0, 40)}`);
+        if (t.length < 2 || t.length > 40) return;
+        const cs = window.getComputedStyle(el as HTMLElement);
+        if (cs.cursor !== 'pointer') return;
+        out.push(`${el.tagName}[${(el.className || '').toString().replace(/\s+/g, ' ').slice(0, 55)}]: ${t.slice(0, 35)}`);
       });
-      return [...new Set(out)].slice(0, 15);
+      return [...new Set(out)].slice(0, 30);
     });
-    log('phase-4', `DEBUG button candidates: ${JSON.stringify(candidates)}`);
+    log('phase-4', `DEBUG modal clickables: ${JSON.stringify(candidates)}`);
     throw new Error('Pay button not found after selecting payment method');
   }
 
