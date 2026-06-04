@@ -120,19 +120,34 @@ async function phase1_loadAndCleanup(page: Page, config: PurchaseConfig): Promis
 
   await clearOverlays(page);
 
-  // Dismiss cookie consent ONLY — never click "Yes"/"نعم" as those trigger region redirect
+  // Dismiss cookie consent ONLY — never click "Yes"/"نعم" as those trigger region redirect.
+  // The EG/Arabic banner button is "قبول جميع ملفات تعريف الارتباط الاختيارية"
+  // (Accept all optional cookies) with class MidasbuyUI-btn_* — substring-match
+  // it across all clickable elements, retrying since it can render late.
   log('phase-1', 'Dismissing cookie popups...');
-  for (const text of ['قبول', 'Accept']) {
-    try { await jsClickButtonByText(page, text); } catch { /* may not exist */ }
-  }
-  // Target cookie button directly by class
-  try {
-    await page.evaluate(() => {
-      const btn = document.querySelector('[class*="cookie"] button, [class*="Cookie"] button') as HTMLElement | null;
-      btn?.click();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const dismissed = await page.evaluate(() => {
+      const accepts = ['قبول جميع', 'قبول', 'Accept all', 'Accept All', 'Accept'];
+      const els = document.querySelectorAll('button, [class*="btn"], [class*="Button"]');
+      for (const acc of accepts) {
+        for (const el of Array.from(els)) {
+          const t = (el.textContent || '').trim();
+          // Match accept-cookie wording; avoid the region "Yes/نعم" dialog.
+          if (t.includes(acc) && t.length < 80 && !/نعم|^Yes$/.test(t)) {
+            (el as HTMLElement).click();
+            return t.slice(0, 50);
+          }
+        }
+      }
+      return null;
     });
-  } catch { /* may not exist */ }
-  await page.waitForTimeout(1000);
+    if (dismissed) {
+      log('phase-1', `Cookie banner dismissed: "${dismissed}"`);
+      await page.waitForTimeout(800);
+      break;
+    }
+    await page.waitForTimeout(800);
+  }
 
   // Final safety check: if somehow redirected to /gb/, navigate back to /eg/
   if (!page.url().includes('/eg/')) {
