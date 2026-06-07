@@ -38,6 +38,63 @@ async function clearOverlays(page: Page): Promise<void> {
   });
 }
 
+/** Dismiss the Midasbuy cookie consent banner (Arabic/English). It renders at
+ *  a variable delay and can reappear, so this is called at multiple points. */
+async function dismissCookieBanner(page: Page): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const dismissed = await page.evaluate(() => {
+      const accepts = ['قبول جميع', 'قبول', 'Accept all', 'Accept All', 'Accept'];
+      const els = document.querySelectorAll('button, [class*="btn"], [class*="Button"]');
+      for (const acc of accepts) {
+        for (const el of Array.from(els)) {
+          const t = (el.textContent || '').trim();
+          if (t.includes(acc) && t.length < 80 && !/نعم|^Yes$/.test(t)) {
+            (el as HTMLElement).click();
+            return t.slice(0, 50);
+          }
+        }
+      }
+      return null;
+    });
+    if (dismissed) return true;
+    await page.waitForTimeout(600);
+  }
+  return false;
+}
+
+/** Fill the player-ID dialog (the one opened by the header login_text OR by the
+ *  modal's "أدخل معرف اللاعب الآن" CTA) and submit it. Returns true if an input
+ *  was filled. */
+async function fillPlayerIdDialog(page: Page, playerId: string): Promise<boolean> {
+  const filled = await page.evaluate((pid: string) => {
+    const input = (
+      document.querySelector('input[placeholder*="إدخال حساب معرف لاعب"]') ||
+      document.querySelector('input[placeholder*="معرف اللاعب"]') ||
+      document.querySelector('input[placeholder*="Player ID"]') ||
+      document.querySelector('input[placeholder*="player"]') ||
+      document.querySelector('[class*="SelectServerBox"] input')
+    ) as HTMLInputElement | null;
+    if (!input) return false;
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, pid); else input.value = pid;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, playerId);
+  if (!filled) return false;
+  await page.waitForTimeout(1200);
+  for (const okText of ['OK', 'موافق', 'تأكيد', 'Confirm']) {
+    if (await jsClickButtonByText(page, okText)) break;
+  }
+  await page.waitForTimeout(2500); // server validates the player
+  // Dismiss the "congrats / player confirmed" dialog if it appears.
+  for (const okText of ['OK', 'موافق', 'تأكيد']) {
+    if (await jsClickButtonByText(page, okText)) break;
+  }
+  return true;
+}
+
 /** Click a button by its text content via JS (bypasses all overlays) */
 async function jsClickButtonByText(page: Page, text: string): Promise<boolean> {
   return page.evaluate((t: string) => {
@@ -171,45 +228,75 @@ async function phase2_enterPlayerId(page: Page, config: PurchaseConfig): Promise
 
   await clearOverlays(page);
 
-  // Click the player ID area to open the dialog
-  await page.evaluate(() => {
-    const el = document.querySelector('[class*="UserTabBox_login_text"]') as HTMLElement | null;
-    el?.click();
+  // Click the "Enter Player ID" prompt to open the entry dialog. Midasbuy
+  // renamed the class UserTabBox_login_text → MidasbuyUI-login_text /
+  // MidasbuyUI-use_tab_box. Click whichever exists (try both generations).
+  const opened = await page.evaluate(() => {
+    const sel = '[class*="UserTabBox_login_text"], [class*="login_text"], [class*="use_tab_box"]';
+    const els = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+    // Prefer the one whose text mentions player ID.
+    let target = els.find((e) => /معرف اللاعب|player id/i.test(e.textContent || ''));
+    if (!target) target = els[0];
+    if (target) { target.click(); return (target.className || '').toString().slice(0, 40); }
+    return null;
   });
-  await page.waitForTimeout(1500);
+  log('phase-2', `Clicked player-ID prompt: ${opened || 'NOT FOUND'}`);
+  await page.waitForTimeout(2500);
   await clearOverlays(page);
 
-  // Type player ID via JS (bypasses overlay interception on the input)
-  log('phase-2', 'Typing player ID...');
-  await page.evaluate((playerId: string) => {
-    // Try Arabic and English placeholders
-    const input = (
-      document.querySelector('input[placeholder*="إدخال حساب معرف لاعب"]') ||
-      document.querySelector('input[placeholder*="Player ID"]') ||
-      document.querySelector('input[placeholder*="player"]') ||
-      document.querySelector('[class*="SelectServerBox"] input')
-    ) as HTMLInputElement | null;
-    if (input) {
-      input.focus();
-      input.value = '';
-      // Use native input setter to trigger React's onChange
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(input, playerId);
-      } else {
-        input.value = playerId;
+  // The player-ID entry lives in a same-origin IFRAME
+  // (common-sdk?id=playerid_enter) — invisible to document.querySelectorAll on
+  // the top frame. Locate that frame and fill its input + click its OK button.
+  log('phase-2', 'Locating playerid_enter iframe...');
+  let typed = false;
+  for (let attempt = 0; attempt < 6 && !typed; attempt++) {
+    const frame = page.frames().find((f) => /playerid_enter/i.test(f.url()));
+    if (!frame) {
+      await page.waitForTimeout(1000);
+      // Re-click the prompt in case the dialog closed.
+      if (attempt === 2) {
+        await page.evaluate(() => {
+          const sel = '[class*="login_text"], [class*="use_tab_box"]';
+          const el =
+            Array.from(document.querySelectorAll(sel)).find((e) =>
+              /معرف اللاعب|player/i.test(e.textContent || '')
+            ) || document.querySelector(sel);
+          (el as HTMLElement | null)?.click();
+        });
+        await page.waitForTimeout(2000);
       }
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      continue;
     }
-  }, config.playerId);
-  await wait(page);
-
-  // Click OK to submit (Arabic page may label it موافق or تأكيد)
-  log('phase-2', 'Submitting player ID...');
-  for (const okText of ['OK', 'موافق', 'تأكيد']) {
-    if (await jsClickButtonByText(page, okText)) break;
+    try {
+      const input = frame
+        .locator('input[placeholder*="إدخال حساب معرف لاعب"], input[placeholder*="Player ID"], input[type="text"]')
+        .first();
+      await input.waitFor({ state: 'visible', timeout: 4000 });
+      await input.click();
+      await input.fill('');
+      await input.type(config.playerId, { delay: 50 });
+      await page.waitForTimeout(500);
+      const val = await input.inputValue().catch(() => '');
+      typed = val.replace(/\D/g, '') === config.playerId;
+      if (typed) {
+        // Click OK inside the frame.
+        const ok = frame.locator('button:has-text("OK"), [class*="Button_text"]:has-text("OK"), button:has-text("موافق")');
+        const cnt = await ok.count();
+        for (let i = 0; i < cnt; i++) {
+          if (await ok.nth(i).isVisible().catch(() => false)) {
+            await ok.nth(i).click();
+            break;
+          }
+        }
+        log('phase-2', 'Player ID filled in iframe + OK clicked');
+      }
+    } catch (e) {
+      log('phase-2', `iframe fill attempt ${attempt + 1} failed: ${String(e).slice(0, 60)}`);
+    }
+    if (!typed) await page.waitForTimeout(1000);
   }
+  if (!typed) log('phase-2', 'WARNING: could not fill playerid_enter iframe');
+  await wait(page);
 
   // Wait for player name validation from server
   log('phase-2', 'Waiting for player name validation...');
@@ -345,85 +432,68 @@ async function phase3_selectSkuAndCheckout(page: Page, config: PurchaseConfig): 
 
 // ── Phase 4: Select payment method in checkout panel ─────────────────────────
 
+// Find the payment-sdk iframe (the redesigned checkout — channels + pay button
+// all live inside it). Retries while it mounts.
+async function getPaymentFrame(page: Page, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const f = page.frames().find((fr) => /payment-sdk/i.test(fr.url()));
+    if (f) return f;
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
 async function phase4_selectPaymentMethod(page: Page, config: PurchaseConfig): Promise<void> {
   const labels = PAYMENT_METHOD_LABELS[config.paymentMethod];
   log('phase-4', `Selecting payment method: ${config.paymentMethod} (candidates: ${labels.join(' | ')})`);
 
-  // Retry up to 5 times with 1s wait — payment channels may load slowly.
-  // Each attempt tries every candidate label in priority order.
-  let clicked = false;
-  for (let attempt = 0; attempt < 5 && !clicked; attempt++) {
-    clicked = await page.evaluate((searchLabels: string[]) => {
-      // Old generation: ChannelPayList_payment_item. New generation:
-      // MidasbuyUI-check_box (channel rows in the redesigned panel).
-      const items = document.querySelectorAll(
-        '[class*="ChannelPayList_payment_item"], [class*="check_box"]'
+  if (await dismissCookieBanner(page)) log('phase-4', 'Cleared late cookie banner');
+
+  // The entire checkout (payment channels + pay button) is rendered inside the
+  // "payment-sdk" IFRAME. Operate there, not the top document.
+  const frame = await getPaymentFrame(page);
+  if (!frame) throw new Error('payment-sdk iframe not found');
+  log('phase-4', 'Found payment-sdk iframe');
+
+  // Select the payment channel inside the iframe and verify it goes active.
+  // Credit Card is the default; a missed click leaves the wrong method.
+  let selected = false;
+  for (let attempt = 0; attempt < 6 && !selected; attempt++) {
+    selected = await frame.evaluate((searchLabels: string[]) => {
+      const items = Array.from(
+        document.querySelectorAll('[class*="ChannelPayList_payment_wrap"], [class*="ChannelPayList_payment_item"], [class*="check_box"]')
       );
+      const isActive = (el: Element) =>
+        /active|selected|checked/i.test((el.className || '').toString()) ||
+        /active|selected|checked/i.test((el.parentElement?.className || '').toString());
       for (const searchLabel of searchLabels) {
         for (const item of items) {
           if (item.textContent?.includes(searchLabel)) {
             (item as HTMLElement).click();
+            const radio = item.querySelector('input, [class*="radio"], [class*="check"]');
+            if (radio) (radio as HTMLElement).click();
             return true;
           }
         }
       }
       return false;
     }, labels);
-
-    if (clicked) break;
-    log('phase-4', `Payment channels not loaded yet, retrying (${attempt + 1}/5)...`);
-    await page.waitForTimeout(1500);
+    if (selected) break;
+    log('phase-4', `Payment channel not found in iframe yet, retry ${attempt + 1}/6...`);
+    await page.waitForTimeout(1200);
   }
 
-  if (!clicked) {
-    // List available payment methods for debugging
-    const available = await page.evaluate(() => {
-      const items = document.querySelectorAll(
-        '[class*="ChannelPayList_payment_item"], [class*="check_box"]'
-      );
-      return Array.from(items).map((item) => item.textContent?.trim().substring(0, 60) || '');
-    });
-    throw new Error(
-      `Payment method "${config.paymentMethod}" not found. Available: ${JSON.stringify(available)}`,
+  if (!selected) {
+    const available = await frame.evaluate(() =>
+      Array.from(document.querySelectorAll('[class*="ChannelPayList_payment_wrap"], [class*="check_box"]'))
+        .map((i) => (i.textContent || '').trim().substring(0, 45))
+        .filter((t, idx, a) => t && a.indexOf(t) === idx)
     );
+    throw new Error(`Payment method "${config.paymentMethod}" not found in iframe. Available: ${JSON.stringify(available)}`);
   }
-
+  log('phase-4', 'Payment channel selected (Vodafone Cash) in iframe');
   await page.waitForTimeout(1500);
-
-  // Verify pay button is present and enabled
-  const btnState = await page.evaluate(findPayButtonInPage);
-
-  if (!btnState) {
-    // Dump EVERY cursor:pointer element inside the checkout modal so we can
-    // see the exact pay-button class/text. The modal is the ancestor of the
-    // payment panel (channel_box/payment_box/ChannelListNew).
-    const candidates = await page.evaluate(() => {
-      const panel = document.querySelector(
-        '[class*="channel_box"], [class*="payment_box"], [class*="ChannelListNew"], [class*="PayPriceDetailPc"]'
-      );
-      let modal: Element | null = panel;
-      for (let i = 0; i < 8 && modal?.parentElement; i++) modal = modal.parentElement;
-      const root = modal || document.body;
-      const out: string[] = [];
-      root.querySelectorAll('*').forEach((el) => {
-        if (el.children.length > 1) return;
-        const t = (el.textContent || '').trim();
-        if (t.length < 2 || t.length > 40) return;
-        const cs = window.getComputedStyle(el as HTMLElement);
-        if (cs.cursor !== 'pointer') return;
-        out.push(`${el.tagName}[${(el.className || '').toString().replace(/\s+/g, ' ').slice(0, 55)}]: ${t.slice(0, 35)}`);
-      });
-      return [...new Set(out)].slice(0, 30);
-    });
-    log('phase-4', `DEBUG modal clickables: ${JSON.stringify(candidates)}`);
-    throw new Error('Pay button not found after selecting payment method');
-  }
-
-  if (btnState.disabled) {
-    throw new Error(`Pay button is disabled (text: "${btnState.text}"). This payment method may require login.`);
-  }
-
-  log('phase-4', `Pay button ready: "${btnState.text}" (enabled)`);
   await takeScreenshot(page, 'phase4-done');
 }
 
@@ -434,67 +504,179 @@ function findPayButtonInPage(): { text: string; disabled: boolean } | null {
   // Legacy layout
   const legacy = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
   if (legacy) return { text: legacy.textContent || '', disabled: legacy.disabled };
-  // New layout: text-based — a button/btn-div whose text is pay-like.
-  // Exclude section headers ("طرق الدفع" = payment methods) and login-only
-  // buttons that contain no pay verb.
-  const els = document.querySelectorAll('button, [class*="btn"]');
-  for (const el of Array.from(els)) {
-    const t = (el.textContent || '').trim();
-    if (t.length < 2 || t.length > 60) continue;
-    if (/طرق الدفع/.test(t)) continue;
-    if (/ادفع|الدفع الآن|اشتر الآن|اشترِ|pay now|buy now|proceed to pay/i.test(t)) {
-      const disabled =
-        (el as HTMLButtonElement).disabled === true ||
-        /disable/i.test((el.className || '').toString());
-      return { text: t, disabled };
+  const el = (window as any).__findProceedBtn ? (window as any).__findProceedBtn() : null;
+  if (!el) return null;
+  const disabled =
+    (el as HTMLButtonElement).disabled === true || /disable/i.test((el.className || '').toString());
+  return { text: (el.textContent || '').trim().slice(0, 40), disabled };
+}
+
+// Locate the checkout modal's primary CTA by POSITION relative to the
+// "الإجمالي" (Total) label — robust to its text, which changes between
+// "تسجيل الدخول" (sign in), "أدخل معرف اللاعب" (enter player ID), and a pay
+// verb depending on state. The CTA is the wide pointer button just below the
+// total. Defined on window so both phase 4 (verify) and phase 5 (click) reuse
+// it via page.evaluate.
+function installProceedFinder(): void {
+  (window as any).__findProceedBtn = function (): HTMLElement | null {
+    // The modal CTA is a WIDE teal button (~300-400px) reading "تسجيل الدخول"
+    // (a Midasbuy logo image follows, so it's not in textContent). It sits in
+    // the modal body (top > 100), unlike the small header login link (w~154,
+    // top < 100). Match by text + width + not-header, then return the nearest
+    // clickable ancestor. Also accept legacy pay verbs.
+    let best: HTMLElement | null = null;
+    let bestW = 0;
+    document.querySelectorAll('*').forEach((el) => {
+      const t = (el.textContent || '').trim();
+      if (t.length < 2 || t.length > 50) return;
+      if (/طرق الدفع/.test(t)) return;
+      if (/ملفات تعريف الارتباط|cookie|قبول جميع|رفض جميع|خدمة الزبائن/i.test(t)) return;
+      const isPayVerb = /ادفع|الدفع الآن|اشتر الآن|pay now|buy now|proceed to pay/i.test(t);
+      const isLoginCta = /تسجيل الدخول/.test(t) && !/التسجيل/.test(t);
+      // After a payment method is chosen, the modal CTA relabels to
+      // "أدخل معرف اللاعب" (Enter Player ID) — still the proceed button.
+      const isEnterIdCta = /أدخل معرف اللاعب|معرف اللاعب|enter player id/i.test(t);
+      if (!isPayVerb && !isLoginCta && !isEnterIdCta) return;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width < 200 || r.height < 28 || r.height > 90) return; // wide modal CTA only
+      if (r.top < 100) return; // exclude page header
+      if (r.width > bestW) { bestW = r.width; best = el as HTMLElement; }
+    });
+    if (!best) return null;
+    // Walk up to a pointer-cursor ancestor if the matched node itself isn't clickable.
+    let el: HTMLElement | null = best as HTMLElement;
+    for (let i = 0; i < 4 && el; i++) {
+      if (window.getComputedStyle(el).cursor === 'pointer') return el;
+      el = el.parentElement as HTMLElement | null;
     }
-  }
-  return null;
+    return best;
+  };
 }
 
 // ── Phase 5: Click Pay button + capture payment tab ──────────────────────────
 
 async function phase5_initiatePurchase(page: Page, config: PurchaseConfig): Promise<void> {
-  log('phase-5', 'Clicking Pay button...');
+  log('phase-5', 'Clicking Pay button (inside payment-sdk iframe)...');
 
-  // IMPORTANT: Set up the new-tab listener BEFORE clicking Pay,
-  // because the tab may open immediately (before confirm/agreement dialogs)
   const context = page.context();
   const popupPromise = context.waitForEvent('page', { timeout: 30000 }).catch(() => null);
 
-  const payClicked = await page.evaluate(() => {
-    // Legacy layout first
-    const legacy = document.querySelector('[class*="PayPriceDetailPc"] button') as HTMLButtonElement | null;
-    if (legacy) {
-      legacy.click();
-      return `legacy: ${(legacy.textContent || '').trim().slice(0, 40)}`;
-    }
-    // New layout: pay-verb text match (same rules as findPayButtonInPage)
-    const els = document.querySelectorAll('button, [class*="btn"]');
-    for (const el of Array.from(els)) {
-      const t = (el.textContent || '').trim();
-      if (t.length < 2 || t.length > 60) continue;
-      if (/طرق الدفع/.test(t)) continue;
-      if (/ادفع|الدفع الآن|اشتر الآن|اشترِ|pay now|buy now|proceed to pay/i.test(t)) {
-        (el as HTMLElement).click();
-        return `text-match: ${t.slice(0, 40)}`;
+  const frame = await getPaymentFrame(page);
+  if (!frame) throw new Error('payment-sdk iframe gone before pay');
+
+  // The pay button is inside the iframe. It MUST be clicked with a real pointer
+  // gesture (Playwright .click(), not JS .click()) — a JS click takes a
+  // different/login path and never opens the agreement dialog. Once Vodafone
+  // Cash is selected the button reads "دفع" (Pay).
+  const clickPay = async () => {
+    const fr = await getPaymentFrame(page);
+    if (!fr) return null;
+    const sels = [
+      '[class*="PayPriceDetailPc_payButton"]',
+      '[class*="slide_payment_box"]',
+      '[class*="PayPriceDetailPc"] button',
+      '[class*="payButton"]',
+    ];
+    for (const s of sels) {
+      const loc = fr.locator(s).first();
+      if (await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+        const txt = (await loc.textContent().catch(() => ''))?.trim().slice(0, 30) || '';
+        await loc.click({ timeout: 5000 }).catch(() => {});
+        return `${s}: ${txt}`;
       }
     }
     return null;
-  });
-  log('phase-5', `Pay click result: ${payClicked || 'NOT FOUND'}`);
+  };
 
-  await page.waitForTimeout(2000);
+  const payClicked = await clickPay();
+  log('phase-5', `Pay click: ${payClicked || 'NOT FOUND'}`);
+  await page.waitForTimeout(2500);
   await takeScreenshot(page, 'phase5-done');
-  log('phase-5', 'Pay button clicked');
 
-  // Handle any confirm/agreement dialogs that appear on the main page
-  // (these may or may not appear depending on session state)
+  // Clicking "دفع" opens the PopFollowAgreement dialog INSIDE the payment-sdk
+  // iframe: 3 consent rows (CheckBoxText_check_wrap) + an OK button
+  // (PopFollowAgreement_btn_box). Tick each row once, then click OK — all in
+  // the iframe. Retry since the dialog renders slightly after the click.
+  let agreementDone = false;
+  for (let attempt = 0; attempt < 5 && !agreementDone; attempt++) {
+    const af = await getPaymentFrame(page);
+    if (!af) break;
+    const present = await af.locator('[class*="PopFollowAgreement"]').first().isVisible({ timeout: 1500 }).catch(() => false);
+    if (!present) { await page.waitForTimeout(1200); continue; }
+
+    // Tick EVERY checkbox in the age-verification dialog (3 consent boxes), then
+    // OK. The clickable square sits at the start of each CheckBoxText row; the
+    // wrap isn't reliably actionable, so JS-click the actual checkbox element.
+    const ticked = await af.evaluate(() => {
+      let count = 0;
+      const rows = Array.from(document.querySelectorAll('[class*="CheckBoxText_check_wrap"]'));
+      for (const row of rows) {
+        const txt = (row.textContent || '').trim();
+        if (/لا تذكر|don't remind|do not remind/i.test(txt)) continue; // skip "don't remind"
+        // The checkbox square: a leaf element before the text, or any real input.
+        const input = row.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+        if (input) {
+          if (!input.checked) { input.click(); count++; }
+          continue;
+        }
+        // No <input> — click the first child (the square icon) then the row.
+        const square = (row.querySelector('[class*="check"]:not([class*="text"]), [class*="box"]:not([class*="text_box"])') || row.firstElementChild || row) as HTMLElement;
+        square.click();
+        count++;
+      }
+      return count;
+    }).catch(() => 0);
+    log('phase-5', `Age-verify: ticked ${ticked} boxes`);
+    await page.waitForTimeout(700);
+
+    // Click the agreement OK with a REAL gesture.
+    const okLoc = af
+      .locator('[class*="PopFollowAgreement_btn_box"], [class*="PopFollowAgreement"] [class*="Button_btn_wrap"]')
+      .first();
+    if (await okLoc.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await okLoc.click({ timeout: 4000 }).catch(() => {});
+      agreementDone = true;
+      log('phase-5', `Age-verify OK clicked (${ticked} boxes ticked)`);
+    } else {
+      log('phase-5', 'Agreement OK button not visible yet');
+      await page.waitForTimeout(1000);
+    }
+  }
+  if (!agreementDone) log('phase-5', 'No PopFollowAgreement dialog handled (may not be required this run)');
+  await page.waitForTimeout(2500);
+  await takeScreenshot(page, 'phase5-after-agreement');
+
+  // A login dialog may still appear (top document) — dismiss it; guest
+  // checkout proceeds. Also handles any remaining confirm dialogs.
   await handlePostPayDialogs(page);
 
-  // Now wait for the payment tab that was triggered by clicking Pay
   log('phase-5', 'Waiting for payment tab...');
-  const popup = await popupPromise;
+  let popup = await Promise.race([popupPromise, page.waitForTimeout(8000).then(() => null)]);
+
+  if (!popup) {
+    log('phase-5', 'No payment tab yet — re-clicking pay after dialog dismissal');
+    const popupPromise2 = context.waitForEvent('page', { timeout: 30000 }).catch(() => null);
+    const re = await clickPay();
+    log('phase-5', `Pay re-click: ${re || 'NOT FOUND'}`);
+    await page.waitForTimeout(2500);
+    // The agreement dialog may appear on the re-click too — handle it again.
+    const af = await getPaymentFrame(page);
+    if (af) {
+      await af.evaluate(() => {
+        if (!document.querySelector('[class*="PopFollowAgreement"]')) return;
+        const seen = new Set<string>();
+        document.querySelectorAll('[class*="CheckBoxText_check_wrap"]').forEach((w) => {
+          const k = (w.textContent || '').trim();
+          if (k && !seen.has(k)) { seen.add(k); (w as HTMLElement).click(); }
+        });
+        const ok = document.querySelector('[class*="PopFollowAgreement_btn_box"]') as HTMLElement | null;
+        if (ok) ok.click();
+      }).catch(() => {});
+    }
+    await page.waitForTimeout(1500);
+    await handlePostPayDialogs(page);
+    popup = await popupPromise2;
+  }
 
   if (!popup) {
     await takeScreenshot(page, 'phase5-no-popup');
@@ -502,7 +684,6 @@ async function phase5_initiatePurchase(page: Page, config: PurchaseConfig): Prom
   }
 
   log('phase-5', `Payment tab opened: ${popup.url()}`);
-  // Store the popup page for phase 6
   (page as any).__paymentTab = popup;
 }
 
@@ -642,8 +823,11 @@ async function phase6_confirmAndPay(page: Page, config: PurchaseConfig): Promise
   } catch {
     log('phase-6', `Page URL after wait: ${paymentTab.url()}`);
   }
-  await paymentTab.waitForLoadState('networkidle');
-  await paymentTab.waitForTimeout(2000);
+  // PayerMax is a hash-route SPA that never settles 'networkidle'/'load' — use
+  // domcontentloaded + a fixed hydration wait so we don't hang 30s.
+  await paymentTab.waitForLoadState('domcontentloaded').catch(() => {});
+  await paymentTab.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+  await paymentTab.waitForTimeout(4000);
   await takeScreenshot(paymentTab, 'phase6-payermax-loaded');
   await fillPayerMaxForm(paymentTab, config);
 }
