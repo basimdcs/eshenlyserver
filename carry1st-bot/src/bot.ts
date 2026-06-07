@@ -16,6 +16,10 @@ export class Carry1stBot {
   private config: FullConfig;
   private purchaseStartedAt: number = 0;
   private expectedAmount: number = NaN;
+  // Latest Carry1st player-validation API result (captured from the XHR the
+  // page fires after the account ID is entered). Lets us fail fast with the
+  // real reason instead of timing out on a permanently-disabled BUY NOW.
+  private validation: { ok: boolean; status: number; errorCode?: string; errorMessage?: string } | null = null;
 
   constructor(config: FullConfig) {
     this.config = config;
@@ -101,6 +105,35 @@ export class Carry1stBot {
     });
 
     this.page = await context.newPage();
+
+    // Capture Carry1st's player-validation API response. The page calls
+    //   GET shop-proxy.carry1st.com/api/shop/orders/user-validation?...&recipientIdentifier=<id>
+    // right after the account ID is entered. A non-2xx (or a body with
+    // errorCode/errorMessage) means the ID/bundle can't be purchased as guest
+    // (e.g. 0800 "Sign in to claim this promotion", or an invalid player ID) —
+    // capture it so we can abort with the real reason.
+    this.page.on("response", async (res) => {
+      try {
+        if (!/\/orders\/user-validation/i.test(res.url())) return;
+        const status = res.status();
+        let errorCode: string | undefined;
+        let errorMessage: string | undefined;
+        const text = await res.text().catch(() => "");
+        if (text) {
+          try {
+            const j = JSON.parse(text);
+            errorCode = j.errorCode;
+            errorMessage = j.errorMessage;
+          } catch {}
+        }
+        const ok = status >= 200 && status < 300 && !errorMessage;
+        this.validation = { ok, status, errorCode, errorMessage };
+        log(
+          "Player-validation API",
+          ok ? `ok (${status})` : `FAILED status=${status} code=${errorCode || "?"} msg="${errorMessage || ""}"`
+        );
+      } catch {}
+    });
 
     // Block heavy/irrelevant resources to keep the renderer from OOMing on
     // small-RAM VPSes. Default ON — opt out with BLOCK_MEDIA=false.
@@ -455,6 +488,15 @@ export class Carry1stBot {
 
   async clickBuyNow() {
     await this.ensureNoOverlay("before BUY NOW");
+
+    // Fail fast if Carry1st's player-validation API rejected the ID/bundle —
+    // otherwise BUY NOW stays disabled forever and we'd burn 30s timing out.
+    if (this.validation && !this.validation.ok) {
+      const code = this.validation.errorCode || "unknown";
+      const msg = this.validation.errorMessage || `http ${this.validation.status}`;
+      throw new Error(`Carry1st validation rejected: [${code}] ${msg}`);
+    }
+
     log("Clicking BUY NOW");
     this.purchaseStartedAt = Date.now();
     const buyBtn = this.page.locator('button:has-text("BUY NOW")');
