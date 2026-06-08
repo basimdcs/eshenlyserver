@@ -590,6 +590,16 @@ async function phase5_initiatePurchase(page: Page, config: PurchaseConfig): Prom
 
   const payClicked = await clickPay();
   log('phase-5', `Pay click: ${payClicked || 'NOT FOUND'}`);
+
+  // Fail fast on an invalid player ID. When Midasbuy rejects the entered ID,
+  // the pay CTA reads "أدخل معرف اللاعب" (Enter Player ID) instead of "دفع"
+  // (Pay) — proceeding just times out with a misleading "Payment tab did not
+  // open". Surface the real cause instead.
+  if (payClicked && /أدخل معرف اللاعب|enter player id|معرف اللاعب/i.test(payClicked)) {
+    await takeScreenshot(page, 'phase5-invalid-player');
+    throw new Error(`Invalid player ID: Midasbuy did not accept "${config.playerId}" (pay button still says "Enter Player ID")`);
+  }
+
   await page.waitForTimeout(2500);
   await takeScreenshot(page, 'phase5-done');
 
