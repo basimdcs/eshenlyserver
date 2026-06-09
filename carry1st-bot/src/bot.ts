@@ -818,22 +818,36 @@ export class Carry1stBot {
     const amountParam = Number.isFinite(this.expectedAmount)
       ? `&amount=${this.expectedAmount}`
       : "";
-    const url = `${this.config.otpReceiverUrl}/otp/wait?since=${this.purchaseStartedAt}&timeout=${this.config.otpTimeoutMs}${amountParam}`;
-    try {
-      const res = await fetch(url, {
-        headers: { "X-Token": this.config.otpReceiverToken },
-        signal: AbortSignal.timeout(this.config.otpTimeoutMs + 5000),
-      });
-      if (!res.ok) {
-        log("OTP receiver returned", String(res.status));
-        return null;
+    // Poll in SHORT chunks (25s each) up to the full timeout. The receiver is
+    // behind a Cloudflare tunnel that 524s any single request held longer than
+    // ~100s — so a slow OTP SMS (e.g. 150s) was never seen by one long poll.
+    // `since` stays pinned to purchaseStartedAt so a later chunk still matches
+    // an OTP that arrived during an earlier (timed-out) chunk.
+    const CHUNK_MS = 25_000;
+    const deadline = Date.now() + this.config.otpTimeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const chunk = Math.min(CHUNK_MS, remaining);
+      const url = `${this.config.otpReceiverUrl}/otp/wait?since=${this.purchaseStartedAt}&timeout=${chunk}${amountParam}`;
+      try {
+        const res = await fetch(url, {
+          headers: { "X-Token": this.config.otpReceiverToken },
+          signal: AbortSignal.timeout(chunk + 8000),
+        });
+        if (res.ok) {
+          const body = (await res.json()) as { otp?: string };
+          if (body.otp) return body.otp;
+        } else if (res.status !== 408 && res.status !== 524 && res.status !== 504) {
+          // 408 = receiver's own "no OTP yet"; 524/504 = Cloudflare cut-off —
+          // both are expected between chunks. Anything else is a real error.
+          log("OTP receiver returned", String(res.status));
+        }
+      } catch (err) {
+        log("OTP poll chunk error (continuing)", String(err).slice(0, 60));
       }
-      const body = (await res.json()) as { otp?: string };
-      return body.otp || null;
-    } catch (err) {
-      log("OTP receiver error", String(err));
-      return null;
     }
+    log("OTP not received within timeout", `${Math.round(this.config.otpTimeoutMs / 1000)}s`);
+    return null;
   }
 
   private async waitForPaymobOutcome(

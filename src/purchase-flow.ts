@@ -1306,20 +1306,31 @@ async function waitForOtp(config: PurchaseConfig, expectedAmount: number, sinceM
     return null;
   }
   const amountParam = Number.isFinite(expectedAmount) ? `&amount=${expectedAmount}` : '';
-  const url = `${config.otpReceiverUrl}/otp/wait?since=${sinceMs}&timeout=${config.otpTimeoutMs}${amountParam}`;
-  try {
-    const res = await fetch(url, {
-      headers: { 'X-Token': config.otpReceiverToken },
-      signal: AbortSignal.timeout(config.otpTimeoutMs + 5000),
-    });
-    if (!res.ok) {
-      log('phase-7', `OTP receiver returned ${res.status}`);
-      return null;
+  // Poll in SHORT chunks (25s each) up to the full timeout. The receiver is
+  // behind a Cloudflare tunnel that 524s any single request held longer than
+  // ~100s, so a slow OTP SMS (e.g. 150s) was never seen by one long poll.
+  // `since` stays pinned so a later chunk still matches an OTP that landed
+  // during an earlier (timed-out) chunk.
+  const CHUNK_MS = 25_000;
+  const deadline = Date.now() + config.otpTimeoutMs;
+  while (Date.now() < deadline) {
+    const chunk = Math.min(CHUNK_MS, deadline - Date.now());
+    const url = `${config.otpReceiverUrl}/otp/wait?since=${sinceMs}&timeout=${chunk}${amountParam}`;
+    try {
+      const res = await fetch(url, {
+        headers: { 'X-Token': config.otpReceiverToken },
+        signal: AbortSignal.timeout(chunk + 8000),
+      });
+      if (res.ok) {
+        const body = (await res.json()) as { otp?: string };
+        if (body.otp) return body.otp;
+      } else if (res.status !== 408 && res.status !== 524 && res.status !== 504) {
+        log('phase-7', `OTP receiver returned ${res.status}`);
+      }
+    } catch (err) {
+      log('phase-7', `OTP poll chunk error (continuing): ${String(err).slice(0, 60)}`);
     }
-    const body = (await res.json()) as { otp?: string };
-    return body.otp || null;
-  } catch (err) {
-    log('phase-7', `OTP receiver error: ${err}`);
-    return null;
   }
+  log('phase-7', `OTP not received within ${Math.round(config.otpTimeoutMs / 1000)}s`);
+  return null;
 }
