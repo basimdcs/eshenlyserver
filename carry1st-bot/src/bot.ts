@@ -565,6 +565,19 @@ export class Carry1stBot {
     log("Confirming payment on Pay1st page");
     await sleep(5000);
 
+    // The Pay1st "Confirm and pay" page has its OWN billing form (First Name /
+    // Surname / Email / Phone — "the name, mobile number and email you use for
+    // this payment account"). For most products these carry over from the
+    // shop-side contact form, but some checkouts (e.g. Yalla Ludo) collect only
+    // an email upstream, leaving these blank here. An empty form fails
+    // validation and "Pay Now" silently does nothing. Fill any empty field.
+    const { firstName, surname, email, phone } = this.config;
+    await this.fillField("First Name", firstName, { optional: true });
+    await this.fillField("Surname", surname, { optional: true });
+    await this.fillField("Email", email, { optional: true });
+    await this.fillField("Phone number", phone, { optional: true });
+    await sleep(800);
+
     // Playwright reports the Pay Now button as "not visible" due to CSS framework quirks.
     // Use JS click directly to bypass visibility checks. Pay1st may render in
     // Arabic ("ادفع الآن") even when shop locale is en — try both languages.
