@@ -444,14 +444,21 @@ export class Carry1stBot {
   async fillContactDetails() {
     log("Filling contact details");
     const { firstName, surname, email, phone } = this.config;
-    await this.fillField("First name", firstName);
-    await this.fillField("Surname", surname);
+    // Field set varies per product. Some checkouts (e.g. Yalla Ludo) only ask
+    // for an email; first name / surname / phone are absent. Treat those as
+    // best-effort and only hard-require Email.
+    await this.fillField("First name", firstName, { optional: true });
+    await this.fillField("Surname", surname, { optional: true });
     await this.fillField("Email", email);
-    await this.fillField("Phone number", phone);
+    await this.fillField("Phone number", phone, { optional: true });
     await sleep(1000);
   }
 
-  private async fillField(label: string, value: string) {
+  private async fillField(
+    label: string,
+    value: string,
+    opts: { optional?: boolean } = {}
+  ) {
     // Exact-match strategies first so "Email" doesn't match "Valid Email for Voucher".
     const strategies = [
       () => this.page.getByLabel(label, { exact: true }),
@@ -481,6 +488,10 @@ export class Carry1stBot {
       const ph = await inp.getAttribute("placeholder");
       const ariaLabel = await inp.getAttribute("aria-label");
       attrs.push(`name="${name}" placeholder="${ph}" aria-label="${ariaLabel}"`);
+    }
+    if (opts.optional) {
+      log(`  Skipping optional "${label}" — not present on this checkout`);
+      return;
     }
     log(`  Could not find "${label}". Visible inputs:`, attrs.join(" | "));
     throw new Error(`Could not find input field: ${label}`);
