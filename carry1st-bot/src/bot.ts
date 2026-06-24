@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type Page, type Locator } from "playwright";
 import type { FullConfig } from "./types.js";
 
 function log(step: string, detail?: string) {
@@ -174,7 +174,7 @@ export class Carry1stBot {
       const landingUrl = localeMatch[1];
       log("Establishing locale", landingUrl);
       try {
-        await this.page.goto(landingUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+        await this.page.goto(landingUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
         await sleep(2000);
       } catch (err) {
         log("Locale-establishing nav failed (continuing)", String(err).slice(0, 100));
@@ -185,7 +185,7 @@ export class Carry1stBot {
     // "networkidle" never settles on Carry1st (continuous analytics/ads polling)
     // and the chromium renderer OOMs waiting for it on small-RAM VPS. Use
     // domcontentloaded + a fixed hydration wait instead.
-    await this.page.goto(this.config.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await this.page.goto(this.config.url, { waitUntil: "domcontentloaded", timeout: 60000 });
     await this.page.waitForLoadState("load", { timeout: 15000 }).catch(() => {});
     await sleep(3000);
   }
@@ -338,6 +338,94 @@ export class Carry1stBot {
     }
   }
 
+  // Carry1st groups a product's bundles under category "tabs" — small rounded
+  // pills (e.g. "Blood Strike Gold" default + "Blood Strike Pass"). The target
+  // bundle can live under a non-default tab that the initial view doesn't show.
+  // Click each tab pill and re-check for the bundle (also expanding any "Show
+  // more products" under the newly active tab). Returns true once the bundle is
+  // visible. Only invoked when the bundle is missing from the default view, so
+  // the normal Gold-on-default flow is unaffected.
+  private async clickCategoryTabsUntilBundle(
+    bundleBtn: Locator
+  ): Promise<boolean> {
+    // NOTE: keep this evaluate free of NAMED inner functions. tsx/esbuild
+    // (keepNames) rewrites `const foo = () => {}` to reference a `__name`
+    // helper that doesn't exist in the browser context, throwing
+    // "ReferenceError: __name is not defined". Inline the pill test instead.
+    const tabTexts: string[] = await this.page.evaluate(() => {
+      const els = Array.from(
+        document.querySelectorAll("div, button, [role='tab']")
+      );
+      const seen = new Set<string>();
+      const out: string[] = [];
+      for (const e of els) {
+        const c = (e as HTMLElement).className;
+        if (typeof c !== "string") continue;
+        // Category tab pills: small rounded single-line h-8 toggles.
+        if (
+          !/whitespace-nowrap/.test(c) ||
+          !/rounded-\[?8/.test(c) ||
+          !/\bh-8\b/.test(c)
+        )
+          continue;
+        const t = (e.textContent || "").replace(/\s+/g, " ").trim();
+        if (t.length < 2 || t.length > 40) continue;
+        // Skip bundle pills (e.g. "50 + 1 Golds") so we never misclick a bundle.
+        if (/^\d/.test(t) || t.includes("+")) continue;
+        if (seen.has(t)) continue;
+        seen.add(t);
+        out.push(t);
+      }
+      return out;
+    });
+    log("Category tabs found", JSON.stringify(tabTexts));
+    for (const t of tabTexts) {
+      try {
+        const tab = this.page.getByText(t, { exact: true }).first();
+        await tab.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await tab.click({ timeout: 4000 });
+        log("Clicked category tab", t);
+        await sleep(1500);
+        if (
+          await bundleBtn
+            .first()
+            .isVisible({ timeout: 4000 })
+            .catch(() => false)
+        ) {
+          return true;
+        }
+        // Bundle may be behind a "Show more products" expander on this tab.
+        const showMore = this.page
+          .locator('button, div[role="button"]')
+          .filter({ hasText: "Show more products" });
+        if (
+          await showMore
+            .first()
+            .isVisible({ timeout: 1500 })
+            .catch(() => false)
+        ) {
+          log("Expanding 'Show more products' under tab", t);
+          await showMore
+            .first()
+            .click()
+            .catch(() => {});
+          await sleep(1500);
+          if (
+            await bundleBtn
+              .first()
+              .isVisible({ timeout: 4000 })
+              .catch(() => false)
+          ) {
+            return true;
+          }
+        }
+      } catch (e) {
+        log("Category tab click failed", `${t}: ${String(e)}`);
+      }
+    }
+    return false;
+  }
+
   async selectBundle() {
     await this.ensureNoOverlay("before bundle");
     // Belt + suspenders: also force-remove any stale overlay nodes.
@@ -358,20 +446,29 @@ export class Carry1stBot {
       }
     }
     try {
-      await bundleBtn.first().waitFor({ state: "visible", timeout: 8000 });
+      await bundleBtn.first().waitFor({ state: "visible", timeout: 20000 });
     } catch (err) {
-      log("Bundle not found — dumping all bundle-like candidates");
-      const candidates = await this.page.evaluate(() => {
-        const els = Array.from(
-          document.querySelectorAll("button, div[role='button'], label")
-        );
-        return els
-          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
-          .filter((t) => t.length > 0 && t.length < 200)
-          .filter((t, i, arr) => arr.indexOf(t) === i);
-      });
-      log("Candidate button texts", JSON.stringify(candidates, null, 2));
-      throw err;
+      // Bundle isn't on the current view. Carry1st groups bundles under
+      // category "tabs" (e.g. "Blood Strike Gold" default + "Blood Strike
+      // Pass"); the target may live under a non-default tab. Click through the
+      // tabs and re-check before giving up.
+      const foundUnderTab = await this.clickCategoryTabsUntilBundle(bundleBtn);
+      if (foundUnderTab) {
+        log("Bundle reached via category tab");
+      } else {
+        log("Bundle not found — dumping all bundle-like candidates");
+        const candidates = await this.page.evaluate(() => {
+          const els = Array.from(
+            document.querySelectorAll("button, div[role='button'], label")
+          );
+          return els
+            .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
+            .filter((t) => t.length > 0 && t.length < 200)
+            .filter((t, i, arr) => arr.indexOf(t) === i);
+        });
+        log("Candidate button texts", JSON.stringify(candidates, null, 2));
+        throw err;
+      }
     }
     // Try normal click first; if blocked by an overlay that snuck in, fall
     // back to a JS click that bypasses pointer-event interception.
@@ -511,7 +608,7 @@ export class Carry1stBot {
     log("Clicking BUY NOW");
     this.purchaseStartedAt = Date.now();
     const buyBtn = this.page.locator('button:has-text("BUY NOW")');
-    await buyBtn.first().waitFor({ state: "visible", timeout: 10000 });
+    await buyBtn.first().waitFor({ state: "visible", timeout: 25000 });
 
     // Diagnostic: if disabled, dump form state before timing out.
     const isDisabled = await buyBtn.first().isDisabled().catch(() => false);
@@ -689,8 +786,11 @@ export class Carry1stBot {
 
     // No payment SMS arrived — fall back to URL signal.
     if (urlOutcome.kind === "success") {
-      log("⚠️ UI says success but no Vodafone SMS yet", "treating as success but flag for follow-up");
-      return;
+      // Carry1st's UI is unreliable; the Vodafone debit SMS is the only authoritative
+      // "money moved" signal. With the (now 120s) wait, a real payment's SMS will have
+      // arrived — so no SMS here means the payment did NOT confirm. Fail for manual
+      // verification rather than falsely marking the order delivered.
+      throw new Error(`No Vodafone payment confirmation: UI said success but no debit SMS within ${this.config.paymentSmsTimeoutMs}ms — payment unconfirmed, needs verification`);
     }
     if (urlOutcome.kind === "error") {
       throw new Error(`Paymob rejected payment: ${urlOutcome.message}`);

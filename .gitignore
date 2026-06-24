@@ -6,3 +6,9 @@ screenshots/
 *.png
 TEST_LOG.md
 .claude/
+
+# editor/session noise
+*.bak
+*.bak-*
+*.log
+trace-*.jsonl
