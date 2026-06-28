@@ -694,6 +694,32 @@ async function phase5_initiatePurchase(page: Page, config: PurchaseConfig): Prom
   }
 
   log('phase-5', `Payment tab opened: ${popup.url()}`);
+
+  // Midasbuy opens a FAILURE callback instead of the PayerMax form when it
+  // rejects the recharge (e.g. the account is region-locked). Detect it here and
+  // throw a STRUCTURED terminal reason ("invalid_region:" / "payment_failed:")
+  // so the eshenly callback can auto-refund, instead of letting the flow fall
+  // through to a misleading "page/browser has been closed" timeout in phase-6.
+  {
+    const purl = popup.url();
+    if (/\/callback\/fail/i.test(purl)) {
+      let emsg = '';
+      let ecode = '';
+      try {
+        const sp = new URL(purl).searchParams;
+        emsg = decodeURIComponent(sp.get('error_message') || '');
+        ecode = sp.get('error_code') || '';
+      } catch {
+        /* ignore parse errors — fall through to generic payment_failed */
+      }
+      await takeScreenshot(page, 'phase5-payment-rejected');
+      if (/another region|choose another region|region to recharge/i.test(emsg) || /12202/.test(`${ecode} ${emsg}`)) {
+        throw new Error(`invalid_region: Midasbuy rejected the recharge \u2014 this account must top up from another region [${ecode || 'FKV2 12202'}]`);
+      }
+      throw new Error(`payment_failed: Midasbuy rejected the payment${emsg ? ` \u2014 ${emsg.slice(0, 160)}` : ''}${ecode ? ` [${ecode}]` : ''}`);
+    }
+  }
+
   (page as any).__paymentTab = popup;
 }
 
