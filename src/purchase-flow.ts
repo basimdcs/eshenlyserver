@@ -1061,30 +1061,31 @@ async function phase7_paymobWallet(page: Page, config: PurchaseConfig, purchaseS
     });
   }
 
-  // Race two signals: PayerMax/Midasbuy's redirect (UI signal) and the Vodafone
-  // payment confirmation SMS (money-moved signal — authoritative).
-  const [outcome, paymentSms] = await Promise.all([
-    waitForPaymobOutcome(paymobPage, preClickUrl, preClickError),
-    waitForPaymentSms(config, expectedAmount, clickedAt),
-  ]);
+  // Paymob's post_pay redirect carries a SIGNED success=true (txn_response_code=0)
+  // — the authoritative "wallet debited" signal for the PayerMax→Paymob flow.
+  // Trust it and finish immediately; do NOT burn the full SMS timeout after the
+  // payment already went through (that was the old Promise.all bug — every run
+  // stalled ~45s waiting for a confirmation SMS it no longer needed). The
+  // Vodafone SMS is only the fallback when Paymob does NOT clearly succeed.
+  const outcome = await waitForPaymobOutcome(paymobPage, preClickUrl, preClickError);
   await takeScreenshot(paymobPage, 'phase7-after-pay');
 
-  if (paymentSms) {
-    log('phase-7',
-      `✅ Vodafone SMS confirmed payment: txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
-    // Machine-parsable line for the trigger-worker to capture.
-    console.log(`PAYMENT_CONFIRMED txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
-    if (outcome.kind === 'success') {
-      log('phase-7', `Merchant UI also confirmed success → ${paymobPage.url()}`);
-    } else {
-      log('phase-7',
-        `⚠️ DELIVERY VERIFICATION NEEDED — Vodafone debited but merchant UI reported ${outcome.kind}: ${outcome.message || paymobPage.url()}`);
-    }
+  if (outcome.kind === 'success') {
+    const txnId = (paymobPage.url().match(/[?&]id=(\d+)/) || [])[1] || 'paymob';
+    log('phase-7', `✅ Paymob confirmed payment (success=true) → ${paymobPage.url()}`);
+    // Machine-parsable line for the trigger-worker to capture the txn id.
+    console.log(`PAYMENT_CONFIRMED txn=${txnId} amount=${Number.isFinite(expectedAmount) ? expectedAmount : 0} merchant=Paymob`);
     return;
   }
 
-  if (outcome.kind === 'success') {
-    log('phase-7', `Paymob completed → redirected to ${paymobPage.url()} (no SMS within ${config.paymentSmsTimeoutMs}ms)`);
+  // Paymob did NOT clearly succeed (error/timeout). The wallet may still have
+  // been debited (UI lied / slow) — give the confirmation SMS its window as the
+  // authoritative fallback before declaring failure.
+  const paymentSms = await waitForPaymentSms(config, expectedAmount, clickedAt);
+  if (paymentSms) {
+    log('phase-7',
+      `⚠️ DELIVERY VERIFICATION NEEDED — Vodafone debited (txn=${paymentSms.txnId} amount=${paymentSms.amount}) but merchant UI reported ${outcome.kind}: ${outcome.message || paymobPage.url()}`);
+    console.log(`PAYMENT_CONFIRMED txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
     return;
   }
 

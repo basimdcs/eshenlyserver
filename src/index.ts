@@ -137,4 +137,10 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+// Force process exit once main() settles — Playwright/undici can leave a
+// lingering handle that keeps node alive after browser.close(), orphaning the
+// process (which otherwise lingers, holding memory). In non-headless dev mode
+// main() never resolves (it waits forever), so this only fires in production.
+main().finally(() => {
+  process.exit(process.exitCode || 0);
+});
