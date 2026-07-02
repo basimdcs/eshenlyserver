@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page, type Locator } from "playwright";
+import { chromium, type Browser, type Page, type Locator, type Response, type Frame } from "playwright";
 import type { FullConfig } from "./types.js";
 
 function log(step: string, detail?: string) {
@@ -16,6 +16,24 @@ export class Carry1stBot {
   private config: FullConfig;
   private purchaseStartedAt: number = 0;
   private expectedAmount: number = NaN;
+  // Signed Paymob post_pay callback captured at the network level — an
+  // authoritative "wallet debited / declined" signal. Carry1st's own redirect
+  // lies (shows /payment/failure even on success), so we never trust that; but
+  // the underlying accept.paymobsolutions.com/post_pay?success=... IS signed.
+  private paymobSignal: { success: boolean; txnId: string } | null = null;
+  private onPaymobResp: (res: Response) => void = () => {};
+  private onPaymobNav: (frame: Frame) => void = () => {};
+
+  private capturePaymobSignal(u: string): void {
+    if (this.paymobSignal) return;
+    const m = u.match(
+      /accept\.paymobsolutions\.com\/api\/acceptance\/post_pay[^ "']*[?&]success=(true|false)/i
+    );
+    if (!m) return;
+    const idm = u.match(/[?&]id=(\d+)/);
+    this.paymobSignal = { success: m[1].toLowerCase() === "true", txnId: idm ? idm[1] : "paymob" };
+    log("Paymob callback captured", `success=${m[1]} txn=${this.paymobSignal.txnId}`);
+  }
   // Latest Carry1st player-validation API result (captured from the XHR the
   // page fires after the account ID is entered). Lets us fail fast with the
   // real reason instead of timing out on a permanently-disabled BUY NOW.
@@ -738,9 +756,18 @@ export class Carry1stBot {
     log("OTP entered and verified");
     try { await paymobPage.screenshot({ path: "paymob-before-pay.png", fullPage: true }); } catch {}
 
-    const preClickUrl = paymobPage.url();
-    const preClickError = await this.readPaymobErrorText(paymobPage);
     const clickedAt = Date.now();
+
+    // Capture the SIGNED Paymob post_pay callback at the network level BEFORE the
+    // page can redirect to Carry1st's (unreliable) result page.
+    this.onPaymobResp = (res: Response) => {
+      try { this.capturePaymobSignal(res.url()); } catch {}
+    };
+    this.onPaymobNav = (frame: Frame) => {
+      try { if (frame === paymobPage.mainFrame()) this.capturePaymobSignal(frame.url()); } catch {}
+    };
+    paymobPage.on("response", this.onPaymobResp);
+    paymobPage.on("framenavigated", this.onPaymobNav);
 
     log("Clicking 'Pay with Wallet'");
     const payBtn = paymobPage.getByRole("button", { name: /pay with wallet|الدفع/i });
@@ -761,56 +788,56 @@ export class Carry1stBot {
       });
     }
 
-    // Race two signals: Carry1st's redirect (UI signal) and the Vodafone payment
-    // confirmation SMS (money-moved signal — authoritative). Carry1st sometimes
-    // redirects to /payment/failure even when the wallet was actually debited.
-    const [urlOutcome, paymentSms] = await Promise.all([
-      this.waitForPaymobOutcome(paymobPage, preClickUrl, preClickError),
-      this.waitForPaymentSms(clickedAt),
-    ]);
+    // Two AUTHORITATIVE confirmations, whichever lands first: the signed Paymob
+    // post_pay callback (captured above) or the Vodafone debit SMS. Deliver on
+    // either success; fail fast on a signed Paymob decline; fail (manual) if
+    // neither confirms. Carry1st's own /success|/failure redirect is NOT trusted.
+    let paymentSms: { amount: number; merchant: string; txnId: string } | null = null;
+    const deadline = clickedAt + this.config.paymentSmsTimeoutMs;
+    while (Date.now() < deadline) {
+      if (this.paymobSignal) break;
+      paymentSms = await this.waitForPaymentSms(clickedAt, 3000);
+      if (paymentSms) break;
+    }
     try { await paymobPage.screenshot({ path: "paymob-after-pay.png", fullPage: true }); } catch {}
+    paymobPage.off("response", this.onPaymobResp);
+    paymobPage.off("framenavigated", this.onPaymobNav);
 
     if (paymentSms) {
       log("✅ Vodafone SMS confirmed payment",
         `txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
-      // Machine-parsable line for the trigger-worker to capture.
       console.log(`PAYMENT_CONFIRMED txn=${paymentSms.txnId} amount=${paymentSms.amount} merchant=${paymentSms.merchant}`);
-      if (urlOutcome.kind === "success") {
-        log("✅ Merchant UI also confirmed success", paymobPage.url());
-      } else {
-        log("⚠️ DELIVERY VERIFICATION NEEDED",
-          `Vodafone debited but merchant UI reported ${urlOutcome.kind}: ${urlOutcome.message || paymobPage.url()}`);
+      if (this.paymobSignal && !this.paymobSignal.success) {
+        log("⚠️ NOTE", `Vodafone debited but Paymob callback reported success=false (txn=${this.paymobSignal.txnId})`);
       }
       return;
     }
-
-    // No payment SMS arrived — fall back to URL signal.
-    if (urlOutcome.kind === "success") {
-      // Carry1st's UI is unreliable; the Vodafone debit SMS is the only authoritative
-      // "money moved" signal. With the (now 120s) wait, a real payment's SMS will have
-      // arrived — so no SMS here means the payment did NOT confirm. Fail for manual
-      // verification rather than falsely marking the order delivered.
-      throw new Error(`No Vodafone payment confirmation: UI said success but no debit SMS within ${this.config.paymentSmsTimeoutMs}ms — payment unconfirmed, needs verification`);
+    if (this.paymobSignal) {
+      if (this.paymobSignal.success) {
+        log("✅ Signed Paymob callback confirmed payment", `txn=${this.paymobSignal.txnId}`);
+        console.log(`PAYMENT_CONFIRMED txn=${this.paymobSignal.txnId} amount=${Number.isFinite(this.expectedAmount) ? this.expectedAmount : 0} merchant=Paymob`);
+        return;
+      }
+      throw new Error(`Paymob declined the payment (success=false, txn=${this.paymobSignal.txnId})`);
     }
-    if (urlOutcome.kind === "error") {
-      throw new Error(`Paymob rejected payment: ${urlOutcome.message}`);
-    }
-    throw new Error(`No payment SMS within ${this.config.paymentSmsTimeoutMs}ms and no URL settlement. URL: ${paymobPage.url()}`);
+    throw new Error(`No Vodafone SMS and no signed Paymob callback within ${this.config.paymentSmsTimeoutMs}ms — payment unconfirmed, needs verification`);
   }
 
   private async waitForPaymentSms(
-    sinceMs: number
+    sinceMs: number,
+    overrideTimeoutMs?: number
   ): Promise<{ amount: number; merchant: string; txnId: string } | null> {
     if (!this.config.otpReceiverUrl || !this.config.otpReceiverToken) return null;
+    const timeoutMs = overrideTimeoutMs ?? this.config.paymentSmsTimeoutMs;
     const amountParam = Number.isFinite(this.expectedAmount)
       ? `&amount=${this.expectedAmount}`
       : "";
     const merchantParam = `&merchant=${encodeURIComponent(this.config.merchantName)}`;
-    const url = `${this.config.otpReceiverUrl}/payment/wait?since=${sinceMs}&timeout=${this.config.paymentSmsTimeoutMs}${amountParam}${merchantParam}`;
+    const url = `${this.config.otpReceiverUrl}/payment/wait?since=${sinceMs}&timeout=${timeoutMs}${amountParam}${merchantParam}`;
     try {
       const res = await fetch(url, {
         headers: { "X-Token": this.config.otpReceiverToken },
-        signal: AbortSignal.timeout(this.config.paymentSmsTimeoutMs + 5000),
+        signal: AbortSignal.timeout(timeoutMs + 5000),
       });
       if (!res.ok) {
         if (res.status === 404) {
@@ -818,7 +845,7 @@ export class Carry1stBot {
           return null;
         }
         if (res.status === 408) {
-          log("Payment SMS timeout", "no matching SMS received");
+          if (!overrideTimeoutMs) log("Payment SMS timeout", "no matching SMS received");
           return null;
         }
         log("Payment SMS receiver returned", String(res.status));
