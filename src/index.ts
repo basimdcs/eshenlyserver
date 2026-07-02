@@ -47,7 +47,7 @@ async function main(): Promise<void> {
       '--no-zygote',
       '--renderer-process-limit=1',
       '--disable-features=site-per-process,IsolateOrigins,TranslateUI',
-      '--js-flags=--max-old-space-size=384',
+      '--js-flags=--max-old-space-size=768',
     ],
   });
 
