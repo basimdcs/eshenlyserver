@@ -8,6 +8,7 @@ export type PaymentMethod = 'ewallet' | 'credit' | 'fawry' | 'carrier';
 export interface PurchaseConfig {
   playerId: string;
   sku: number;
+  url: string;
   phone: string;
   email: string;
   paymentMethod: PaymentMethod;
@@ -28,6 +29,7 @@ export function parseArgs(): PurchaseConfig {
   program
     .requiredOption('--player-id <id>', 'PUBG Mobile Player ID', process.env.PLAYER_ID)
     .requiredOption('--sku <amount>', 'UC amount to purchase (e.g., 60)', process.env.SKU)
+    .option('--url <url>', 'Midasbuy game buy URL', process.env.MIDASBUY_URL || 'https://www.midasbuy.com/midasbuy/eg/buy/pubgm')
     .option('--phone <number>', 'Payment phone number', process.env.PHONE || '01044456628')
     .option('--email <address>', 'Payment email address', process.env.EMAIL || 'covermytunes@gmail.com')
     .option('--payment-method <method>', 'Payment method: ewallet|credit|fawry|carrier', process.env.PAYMENT_METHOD || 'ewallet')
@@ -47,6 +49,7 @@ export function parseArgs(): PurchaseConfig {
   return {
     playerId: opts.playerId,
     sku: parseInt(opts.sku, 10),
+    url: opts.url,
     phone: opts.phone,
     email: opts.email,
     paymentMethod: opts.paymentMethod as PaymentMethod,

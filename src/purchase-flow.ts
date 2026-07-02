@@ -3,7 +3,6 @@ import { SELECTORS } from './selectors';
 import { PurchaseConfig, PaymentMethod } from './config';
 import { log, logError, takeScreenshot, wait } from './utils';
 
-const MIDASBUY_URL = 'https://www.midasbuy.com/midasbuy/eg/buy/pubgm';
 
 // Candidate labels per method, tried in order. Midasbuy serves the EG page in
 // Arabic intermittently — channel names may render translated, so each method
@@ -141,7 +140,7 @@ export async function runPurchaseFlow(page: Page, config: PurchaseConfig): Promi
 
 async function phase1_loadAndCleanup(page: Page, config: PurchaseConfig): Promise<void> {
   log('phase-1', 'Navigating to Midasbuy...');
-  await page.goto(MIDASBUY_URL, { waitUntil: 'domcontentloaded', timeout: config.timeout });
+  await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: config.timeout });
   await page.waitForTimeout(3000);
 
   await clearOverlays(page);
@@ -166,7 +165,7 @@ async function phase1_loadAndCleanup(page: Page, config: PurchaseConfig): Promis
   // If redirected away from /eg/ (e.g. to /gb/), force navigate back
   if (!page.url().includes('/eg/')) {
     log('phase-1', `Redirected to ${page.url()}, forcing back to /eg/...`);
-    await page.goto(MIDASBUY_URL, { waitUntil: 'domcontentloaded', timeout: config.timeout });
+    await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: config.timeout });
     await page.waitForTimeout(3000);
     // Close the dialog again with Escape — do NOT click Yes/No
     await page.keyboard.press('Escape').catch(() => {});
@@ -209,7 +208,7 @@ async function phase1_loadAndCleanup(page: Page, config: PurchaseConfig): Promis
   // Final safety check: if somehow redirected to /gb/, navigate back to /eg/
   if (!page.url().includes('/eg/')) {
     log('phase-1', `URL drifted to ${page.url()}, forcing back to /eg/...`);
-    await page.goto(MIDASBUY_URL, { waitUntil: 'domcontentloaded', timeout: config.timeout });
+    await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: config.timeout });
     await page.waitForTimeout(3000);
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(1000);
@@ -241,7 +240,17 @@ async function phase2_enterPlayerId(page: Page, config: PurchaseConfig): Promise
     return null;
   });
   log('phase-2', `Clicked player-ID prompt: ${opened || 'NOT FOUND'}`);
-  await page.waitForTimeout(2500);
+  // Wait for the player-ID entry iframe to attach (resolves in <1s normally)
+  // instead of a blind 2.5s; the frame loop below still handles a slow/absent one.
+  await page
+    .waitForFunction(
+      () =>
+        !!Array.from(document.querySelectorAll('iframe')).find((f) =>
+          /playerid_enter/i.test((f as HTMLIFrameElement).src || '')
+        ),
+      { timeout: 4000 }
+    )
+    .catch(() => {});
   await clearOverlays(page);
 
   // The player-ID entry lives in a same-origin IFRAME
@@ -298,9 +307,24 @@ async function phase2_enterPlayerId(page: Page, config: PurchaseConfig): Promise
   if (!typed) log('phase-2', 'WARNING: could not fill playerid_enter iframe');
   await wait(page);
 
-  // Wait for player name validation from server
+  // Wait for player name validation from server — poll until the name renders
+  // (usually 1-2s) instead of a fixed 3s; tolerates slower validation up to 6s.
   log('phase-2', 'Waiting for player name validation...');
-  await page.waitForTimeout(3000);
+  await page
+    .waitForFunction(
+      (playerId: string) => {
+        for (const e of Array.from(document.querySelectorAll('*'))) {
+          if (e.children.length === 0 && e.textContent?.includes(playerId)) {
+            const sib = e.parentElement?.querySelector('[class*="name"], [class*="Name"]');
+            if (sib && (sib.textContent || '').trim()) return true;
+          }
+        }
+        return false;
+      },
+      config.playerId,
+      { timeout: 6000 }
+    )
+    .catch(() => {});
 
   // Verify player name appeared by checking for the player ID in the page
   const nameVisible = await page.evaluate((playerId: string) => {
