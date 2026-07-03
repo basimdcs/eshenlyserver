@@ -1127,14 +1127,25 @@ export class Carry1stBot {
   /** Create the Carry1st order via the headless API (no browser). */
   async createOrderViaApi() {
     const entries = Object.entries(this.config.fields);
-    const recip = entries.find(([k]) => /user\s*id|player\s*id|\bid\b/i.test(k)) || entries[0];
+    // Recipient = the User/Player ID field (never the zone/server).
+    const recip =
+      entries.find(([k]) => /user\s*id|player\s*id/i.test(k)) ||
+      entries.find(([k]) => !/zone|server/i.test(k)) ||
+      entries[0];
     const recipientIdentifier = recip ? recip[1] : "";
-    const extra = Object.fromEntries(entries.filter(([k]) => k !== (recip ? recip[0] : "")));
+    // Multi-field games (e.g. Mobile Legends: User ID + Zone ID) put the FULL field
+    // set in recipientExtraInfo, source-keyed (label lowercased, spaces stripped):
+    // {"userid":"...","zoneid":"..."}. Single-field games use {}. Both formats
+    // confirmed against real browser-bot create-order captures.
+    const recipientExtraInfo =
+      entries.length > 1
+        ? Object.fromEntries(entries.map(([k, v]) => [k.toLowerCase().replace(/\s+/g, ""), v]))
+        : undefined;
     return createCarry1stOrder({
       productUrl: this.config.url,
       bundleLabel: this.config.bundleLabel,
       recipientIdentifier,
-      recipientExtraInfo: Object.keys(extra).length ? extra : undefined,
+      recipientExtraInfo,
       customer: {
         firstName: this.config.firstName,
         lastName: this.config.surname,
