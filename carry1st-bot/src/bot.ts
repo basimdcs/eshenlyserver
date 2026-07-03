@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page, type Locator, type Response, type Frame } from "playwright";
 import type { FullConfig } from "./types.js";
+import { createCarry1stOrder } from "./carry1st-api.js";
 
 function log(step: string, detail?: string) {
   const ts = new Date().toISOString().slice(11, 19);
@@ -1115,32 +1116,76 @@ export class Carry1stBot {
     }
   }
 
+  private toMsisdn(phone: string): string {
+    let p = (phone || "").replace(/\D/g, "");
+    if (p.startsWith("20")) return p;
+    if (p.startsWith("0")) return "20" + p.slice(1);
+    if (p.startsWith("1")) return "20" + p;
+    return p;
+  }
+
+  /** Create the Carry1st order via the headless API (no browser). */
+  async createOrderViaApi() {
+    const entries = Object.entries(this.config.fields);
+    const recip = entries.find(([k]) => /user\s*id|player\s*id|\bid\b/i.test(k)) || entries[0];
+    const recipientIdentifier = recip ? recip[1] : "";
+    const extra = Object.fromEntries(entries.filter(([k]) => k !== (recip ? recip[0] : "")));
+    return createCarry1stOrder({
+      productUrl: this.config.url,
+      bundleLabel: this.config.bundleLabel,
+      recipientIdentifier,
+      recipientExtraInfo: Object.keys(extra).length ? extra : undefined,
+      customer: {
+        firstName: this.config.firstName,
+        lastName: this.config.surname,
+        email: this.config.email,
+        msisdn: this.toMsisdn(this.config.phone),
+      },
+    });
+  }
+
   async run() {
     await this.launch();
     try {
-      await this.navigateToProduct();
-      await this.dismissPopups();
-      await this.fillProductFields();
-      // Carry1st validates the game account ID server-side after the input is
-      // filled. Until validation completes, downstream sections (bundles +
-      // payment cards) may not render. Wait ~5s for the green checkmark /
-      // account nickname to appear.
-      await sleep(5000);
-      await this.selectBundle();
-      await this.fillContactDetails();
-      // Payment cards on some products (Blood Strike, possibly others) only
-      // render AFTER contact details are filled — so select payment last,
-      // right before BUY NOW.
-      await this.selectPaymentMethod();
-      if (this.config.stopBeforeBuy) {
-        log("STOP-BEFORE-BUY", "All fields filled. BUY NOW not clicked. No payment triggered.");
+      // API-FIRST: create the Carry1st order headlessly (replaces the slow, fragile
+      // product-page + pack-selection browser flow — the exact step that timed out
+      // and failed orders), then jump the browser straight to the Pay1st payment URL.
+      // Falls back to the full browser flow on any error, so an order can never fail
+      // during the migration. Disable with CARRY1ST_USE_API=false.
+      let onPaymentPage = false;
+      if (process.env.CARRY1ST_USE_API !== "false") {
         try {
-          await this.page.screenshot({ path: "pre-buy-screenshot.png", fullPage: true });
-          log("Screenshot saved", "pre-buy-screenshot.png");
-        } catch {}
-        return;
+          const api = await this.createOrderViaApi();
+          if (api.ok) {
+            log("✅ API order created", `ref=${api.reference} amount=${api.amount} user=${api.validatedName || "?"}`);
+            await this.page.goto(api.redirectUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+            onPaymentPage = true;
+          } else {
+            log("⚠️ API path failed → browser fallback", `${api.stage}: ${api.error}`);
+          }
+        } catch (e) {
+          log("⚠️ API path threw → browser fallback", String(e).slice(0, 120));
+        }
       }
-      await this.clickBuyNow();
+
+      if (!onPaymentPage) {
+        await this.navigateToProduct();
+        await this.dismissPopups();
+        await this.fillProductFields();
+        await sleep(5000);
+        await this.selectBundle();
+        await this.fillContactDetails();
+        await this.selectPaymentMethod();
+        if (this.config.stopBeforeBuy) {
+          log("STOP-BEFORE-BUY", "All fields filled. BUY NOW not clicked. No payment triggered.");
+          try {
+            await this.page.screenshot({ path: "pre-buy-screenshot.png", fullPage: true });
+            log("Screenshot saved", "pre-buy-screenshot.png");
+          } catch {}
+          return;
+        }
+        await this.clickBuyNow();
+      }
       if (this.config.stopBeforePay) {
         log("STOP-BEFORE-PAY", "On pay.carry1st.com. Pay Now NOT clicked. No OTP sent.");
         try {
