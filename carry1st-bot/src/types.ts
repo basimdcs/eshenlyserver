@@ -3,6 +3,8 @@ export interface OrderParams {
   bundleLabel: string;
   paymentMethod: string;
   fields: Record<string, string>;
+  /** Source-keyed customer inputs (account_id / userid / zoneid) for the API path's recipientExtraInfo. */
+  validationData?: Record<string, string>;
 }
 
 export interface ContactDetails {

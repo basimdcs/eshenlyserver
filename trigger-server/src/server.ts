@@ -158,6 +158,7 @@ async function handleTriggerCarry1st(req: http.IncomingMessage, res: http.Server
     url?: string;
     bundle_label?: string;
     fields?: Record<string, unknown>;
+    validation_data?: Record<string, unknown>;
     callback_url?: string;
     customer_email?: string;
   };
@@ -208,6 +209,10 @@ async function handleTriggerCarry1st(req: http.IncomingMessage, res: http.Server
       url: payload.url,
       bundle_label: payload.bundle_label,
       fields: fieldsClean,
+      validation_data:
+        payload.validation_data && typeof payload.validation_data === 'object'
+          ? JSON.stringify(payload.validation_data)
+          : null,
       callback_url: payload.callback_url,
       customer_email: payload.customer_email || null,
     });

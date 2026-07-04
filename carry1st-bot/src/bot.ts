@@ -1133,14 +1133,18 @@ export class Carry1stBot {
       entries.find(([k]) => !/zone|server/i.test(k)) ||
       entries[0];
     const recipientIdentifier = recip ? recip[1] : "";
-    // Multi-field games (e.g. Mobile Legends: User ID + Zone ID) put the FULL field
-    // set in recipientExtraInfo, source-keyed (label lowercased, spaces stripped):
-    // {"userid":"...","zoneid":"..."}. Single-field games use {}. Both formats
-    // confirmed against real browser-bot create-order captures.
+    // recipientExtraInfo must carry the customer's inputs SOURCE-keyed — the exact
+    // keys eshenly stored (account_id / userid / zoneid). Carry1st rejects a
+    // label-derived key (Yalla Ludo needs "account_id", NOT "userid"), so use the
+    // threaded validationData when present; fall back to the label->key transform
+    // for legacy jobs. (validationType stays GAME — only recipientExtraInfo matters;
+    // confirmed across EA FC / ML / Yalla Ludo.)
     const recipientExtraInfo =
-      entries.length > 1
-        ? Object.fromEntries(entries.map(([k, v]) => [k.toLowerCase().replace(/\s+/g, ""), v]))
-        : undefined;
+      this.config.validationData && Object.keys(this.config.validationData).length
+        ? this.config.validationData
+        : entries.length > 1
+          ? Object.fromEntries(entries.map(([k, v]) => [k.toLowerCase().replace(/\s+/g, ""), v]))
+          : undefined;
     return createCarry1stOrder({
       productUrl: this.config.url,
       bundleLabel: this.config.bundleLabel,

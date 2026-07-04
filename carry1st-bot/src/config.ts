@@ -100,11 +100,24 @@ export function loadConfig(): FullConfig {
     }
   }
 
+  let validationData: Record<string, string> | undefined;
+  if (flags["validation-data"]) {
+    try {
+      const parsed = JSON.parse(flags["validation-data"]);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        validationData = parsed as Record<string, string>;
+      }
+    } catch {
+      /* ignore — API path falls back to the fields-derived extraInfo */
+    }
+  }
+
   return {
     url,
     bundleLabel,
     paymentMethod: flags.payment || "Vodafone Cash",
     fields,
+    validationData,
     firstName: requireEnv("CARRY1ST_FIRST_NAME"),
     surname: requireEnv("CARRY1ST_SURNAME"),
     email: requireEnv("CARRY1ST_EMAIL"),

@@ -44,6 +44,7 @@ addColumn(`ALTER TABLE jobs ADD COLUMN url TEXT`);
 addColumn(`ALTER TABLE jobs ADD COLUMN bundle_label TEXT`);
 addColumn(`ALTER TABLE jobs ADD COLUMN fields_json TEXT`);
 addColumn(`ALTER TABLE jobs ADD COLUMN payment_txn_id TEXT`);
+addColumn(`ALTER TABLE jobs ADD COLUMN validation_data TEXT`);
 
 export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'callback_failed';
 export type BotType = 'pubg' | 'carry1st';
@@ -59,6 +60,7 @@ export interface Job {
   url: string | null;
   bundle_label: string | null;
   fields_json: string | null;
+  validation_data: string | null;
   callback_url: string;
   customer_email: string | null;
   status: JobStatus;
@@ -95,18 +97,20 @@ export function insertCarry1stJob(job: {
   url: string;
   bundle_label: string;
   fields: Record<string, string>;
+  validation_data: string | null;
   callback_url: string;
   customer_email: string | null;
 }): void {
   db.prepare(`
-    INSERT INTO jobs (id, order_id, bot_type, player_id, sku, url, bundle_label, fields_json, callback_url, customer_email, status, created_at)
-    VALUES (?, ?, 'carry1st', '', 0, ?, ?, ?, ?, ?, 'queued', ?)
+    INSERT INTO jobs (id, order_id, bot_type, player_id, sku, url, bundle_label, fields_json, validation_data, callback_url, customer_email, status, created_at)
+    VALUES (?, ?, 'carry1st', '', 0, ?, ?, ?, ?, ?, ?, 'queued', ?)
   `).run(
     job.id,
     job.order_id,
     job.url,
     job.bundle_label,
     JSON.stringify(job.fields),
+    job.validation_data,
     job.callback_url,
     job.customer_email,
     Date.now(),

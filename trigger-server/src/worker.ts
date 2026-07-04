@@ -55,6 +55,7 @@ function runBot(job: Job): Promise<BotRunResult> {
         '--url', job.url || '',
         '--bundle', job.bundle_label || '',
         '--fields', job.fields_json || '{}',
+        ...(job.validation_data ? ['--validation-data', job.validation_data] : []),
       ];
       cwd = CARRY1ST_BOT_DIR;
       logStream.write(`# url=${job.url} bundle="${job.bundle_label}" fields=${job.fields_json}\n`);
