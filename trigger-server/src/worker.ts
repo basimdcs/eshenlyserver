@@ -124,6 +124,8 @@ async function postCallback(job: Job): Promise<{ status: number | null; error: s
     order_id: job.order_id,
     job_id: job.id,
     bot_type: job.bot_type,
+    // job.status is the immutable bot OUTCOME; callback-delivery failures no
+    // longer corrupt it (see recordCallbackAttempt), so this is safe on retries.
     status: job.status === 'success' ? 'success' : 'failed',
     amount_charged: job.amount_charged,
     trade_token: job.trade_token,
@@ -142,7 +144,7 @@ async function postCallback(job: Job): Promise<{ status: number | null; error: s
         'x-signature': sig,
       },
       body,
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(20_000),
     });
     return { status: res.status, error: res.ok ? null : `http ${res.status}` };
   } catch (err) {

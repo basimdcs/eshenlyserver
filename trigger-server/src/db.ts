@@ -165,21 +165,29 @@ export function markFinished(
 }
 
 export function recordCallbackAttempt(id: string, status: number | null, error: string | null): void {
+  // NEVER touch `status` here. It holds the BOT OUTCOME ('success'/'failed') that
+  // the callback body reports to eshenly. A failed callback DELIVERY (non-2xx /
+  // timeout) must not corrupt the outcome — otherwise the retry reports a
+  // delivered order as FAILED (customer paid, topup sent, but marked failed).
+  // Callback-delivery state is tracked separately via callback_attempts /
+  // callback_last_status.
   db.prepare(`
     UPDATE jobs SET
       callback_attempts = callback_attempts + 1,
       callback_last_status = ?,
-      callback_last_error = ?,
-      status = CASE WHEN ? BETWEEN 200 AND 299 THEN status ELSE 'callback_failed' END
+      callback_last_error = ?
     WHERE id = ?
-  `).run(status, error, status ?? -1, id);
+  `).run(status, error, id);
 }
 
 export function jobsNeedingCallback(): Job[] {
+  // Retry while the callback hasn't been ACKed (2xx). Keyed off delivery state,
+  // NOT a 'callback_failed' status — the outcome status stays 'success'/'failed'.
   return db.prepare(`
     SELECT * FROM jobs
-    WHERE status IN ('success', 'failed', 'callback_failed')
-      AND (callback_attempts < 5 OR callback_last_status IS NULL)
+    WHERE status IN ('success', 'failed')
       AND finished_at IS NOT NULL
+      AND (callback_last_status IS NULL OR callback_last_status NOT BETWEEN 200 AND 299)
+      AND callback_attempts < 5
   `).all() as Job[];
 }
