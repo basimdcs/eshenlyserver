@@ -770,6 +770,10 @@ export class Carry1stBot {
     paymobPage.on("response", this.onPaymobResp);
     paymobPage.on("framenavigated", this.onPaymobNav);
 
+    // Snapshot any inline message already on the page so a pre-existing text
+    // isn't mistaken for the payment outcome after the click.
+    const preClickError = await this.readPaymobErrorText(paymobPage).catch(() => null);
+
     log("Clicking 'Pay with Wallet'");
     const payBtn = paymobPage.getByRole("button", { name: /pay with wallet|الدفع/i });
     try {
@@ -794,11 +798,26 @@ export class Carry1stBot {
     // either success; fail fast on a signed Paymob decline; fail (manual) if
     // neither confirms. Carry1st's own /success|/failure redirect is NOT trusted.
     let paymentSms: { amount: number; merchant: string; txnId: string } | null = null;
+    let pageError: string | null = null;
     const deadline = clickedAt + this.config.paymentSmsTimeoutMs;
     while (Date.now() < deadline) {
       if (this.paymobSignal) break;
       paymentSms = await this.waitForPaymentSms(clickedAt, 3000);
       if (paymentSms) break;
+      // Paymob rejects wrong-OTP / insufficient-balance INLINE (no redirect, no
+      // signed callback, no SMS) — without this check those die as a blind
+      // 120s timeout. On an inline error, give the authoritative signals a short
+      // grace window in case money moved anyway, then fail with the real reason.
+      const inlineErr = await this.readPaymobErrorText(paymobPage).catch(() => null);
+      if (inlineErr && inlineErr !== preClickError && !/resend|إعادة/i.test(inlineErr)) {
+        pageError = inlineErr;
+        log("Paymob inline error detected", inlineErr);
+        const grace = Date.now() + 20_000;
+        while (Date.now() < grace && !this.paymobSignal && !paymentSms) {
+          paymentSms = await this.waitForPaymentSms(clickedAt, 2000);
+        }
+        break;
+      }
     }
     try { await paymobPage.screenshot({ path: "paymob-after-pay.png", fullPage: true }); } catch {}
     paymobPage.off("response", this.onPaymobResp);
@@ -820,6 +839,9 @@ export class Carry1stBot {
         return;
       }
       throw new Error(`Paymob declined the payment (success=false, txn=${this.paymobSignal.txnId})`);
+    }
+    if (pageError) {
+      throw new Error(`Paymob rejected payment: ${pageError}`);
     }
     throw new Error(`No Vodafone SMS and no signed Paymob callback within ${this.config.paymentSmsTimeoutMs}ms — payment unconfirmed, needs verification`);
   }
@@ -1173,6 +1195,13 @@ export class Carry1stBot {
           const api = await this.createOrderViaApi();
           if (api.ok) {
             log("✅ API order created", `ref=${api.reference} amount=${api.amount} user=${api.validatedName || "?"}`);
+            // The API path skips clickBuyNow(), which is where these are normally
+            // pinned. Left unset, the OTP poll runs with since=0 and no amount
+            // filter, so it can grab a stale OTP from an earlier session — Paymob
+            // then declines with "wrong OTP" and the run dies as a blind timeout.
+            this.purchaseStartedAt = Date.now();
+            const apiAmount = Number(api.amount);
+            if (Number.isFinite(apiAmount)) this.expectedAmount = apiAmount;
             await this.page.goto(api.redirectUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
             onPaymentPage = true;
           } else {
